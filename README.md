@@ -56,21 +56,24 @@ npm run dev
 3. **可选域名**（无域名可直接通过 `http://<ECS公网IP>` 访问全部功能）
 4. **无需申请**：RDS、Redis、OSS、SLB、Docker/K8s
 
-### 一键部署到 ECS
+## 开发环境与线上环境区分
+
+项目通过分层环境变量区分开发态与线上态：
+
+| 环境 | 启动命令 | 版本化默认配置（入库，无密钥） | 默认访问地址 | Session Cookie `Secure` |
+|---|---|---|---|---|
+| 开发环境 | `npm run dev` | `.env.development`、`web/.env.development` | `http://localhost:5173` | `false` |
+| 线上环境 | `npm run start` / `atoms.service` | `.env.production`、`web/.env.production` | `https://atoms.maplink.site` | `true` |
+
+服务端加载优先级（从高到低，不覆盖高优先级）：
+`进程环境变量` > `.env.<env>.local` > `.env.<env>` > `.env.local` > `.env`（共享密钥与账号，如 `GLM_API_KEY`、`DEMO_USERS`）。
+
+### 一键部署到阿里云 ECS
 
 ```bash
-# 在本地将代码同步到 ECS 的 /opt/atoms
-rsync -avz --exclude node_modules --exclude data --exclude .env --exclude dist \
-  ./ root@<ECS_PUBLIC_IP>:/opt/atoms/
+# 同步源码与本地 .env 到 ECS（/opt/atoms），生产构建并重启 atoms.service
+npm run deploy:ecs
 
-# 登录 ECS，编辑 .env 并运行一键初始化脚本
-ssh root@<ECS_PUBLIC_IP>
-cd /opt/atoms
-cp .env.example .env && nano .env   # 填入 GLM_API_KEY、DEMO_USERS、SESSION_SECRET
-
-# 无域名（公网 IP 直连）：
-sudo bash deploy/setup-ecs.sh
-
-# 有域名（自动签发 HTTPS 证书）：
-sudo bash deploy/setup-ecs.sh demo.yourdomain.com
+# 首次全新 ECS 初始化（安装 Node 24、Swap、systemd 与 Caddy）
+sudo bash deploy/setup-ecs.sh atoms.maplink.site
 ```

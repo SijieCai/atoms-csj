@@ -28,6 +28,8 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 
 export interface AuthMeResponse {
   user: { username: string };
+  env?: 'development' | 'production';
+  publicUrl?: string;
   glmConfigured: boolean;
   model: string;
   presets?: AgentPresetSummary[];

@@ -17,6 +17,8 @@ import {
   ArrowRight,
   GitFork,
   PanelRightOpen,
+  WifiOff,
+  RefreshCw,
 } from 'lucide-react';
 import type { AgentPresetSummary, AgentToolStep, MessageDTO, ProjectDTO, WorkspaceDTO } from '@atoms/shared';
 import { AgentStepCard } from './AgentStepCard';
@@ -46,6 +48,8 @@ interface ChatPanelProps {
   isBuilding: boolean;
   suggestBuild: boolean;
   glmConfigured: boolean;
+  connectionState?: 'connected' | 'reconnecting';
+  onRetryConnection?: () => void;
   onSend: (text: string, opts?: { forceBuild?: boolean; targetAgentId?: string }) => Promise<void>;
   onAbort: () => Promise<void>;
   onOpenPreview: () => void;
@@ -92,6 +96,8 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   isBuilding,
   suggestBuild,
   glmConfigured,
+  connectionState = 'connected',
+  onRetryConnection,
   onSend,
   onAbort,
   onOpenPreview,
@@ -374,6 +380,27 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
         <div className="mx-5 mt-3 px-3.5 py-2.5 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-800">
           提示：后端尚未配置 <code className="font-mono font-semibold">GLM_API_KEY</code>，请在{' '}
           <code className="font-mono">.env</code> 填入智谱 API Key 并重启服务。
+        </div>
+      )}
+
+      {connectionState === 'reconnecting' && (
+        <div className="mx-5 mt-3 px-3.5 py-2 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2 min-w-0">
+            <WifiOff className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+            <span className="truncate">
+              与服务器实时连接暂时中断，正在自动重连并同步状态（服务端 Agent 仍在后台独立运行，不会因此停止）...
+            </span>
+          </div>
+          {onRetryConnection && (
+            <button
+              type="button"
+              onClick={onRetryConnection}
+              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-amber-100 hover:bg-amber-200 text-amber-900 font-medium transition cursor-pointer shrink-0"
+            >
+              <RefreshCw className="w-3 h-3 animate-spin" />
+              立即重连
+            </button>
+          )}
         </div>
       )}
 

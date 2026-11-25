@@ -40,7 +40,7 @@ function getActiveRunSnapshot(projectId: string): ActiveRunSnapshot | null {
 }
 
 const app = express();
-app.set('trust proxy', 1);
+app.set('trust proxy', config.trustProxy);
 app.use(cookieParser());
 
 // ---------------------------------------------------------------------------
@@ -91,6 +91,9 @@ app.use('/api/db-proxy', createDbProxyRouter());
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
+    env: config.appEnv,
+    publicDomain: config.publicDomain,
+    publicUrl: config.publicUrl,
     model: config.glmModel,
     glmConfigured: Boolean(config.glmApiKey),
     activeAgents: piManager.getActiveCount(),
@@ -125,6 +128,8 @@ app.get('/api/auth/me', (req, res) => {
   }
   res.json({
     user: { username },
+    env: config.appEnv,
+    publicUrl: config.publicUrl,
     glmConfigured: Boolean(config.glmApiKey),
     model: config.glmModel,
     presets: pluginRegistry.listPresets(),
@@ -291,14 +296,30 @@ function buildHandoffContext(
 // ---------------------------------------------------------------------------
 app.get('/api/events', requireAuth, (req: AuthenticatedRequest, res) => {
   const username = req.user!.username;
+  req.socket?.setKeepAlive?.(true, 15_000);
+  res.setTimeout?.(0);
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders?.();
 
+  const activeProjectIds = new Set<string>(piManager.listActiveProjectIds(username));
+  for (const [pid] of activeChatRuns.entries()) {
+    const p = dbStore.getProject(pid);
+    if (p && p.owner === username) activeProjectIds.add(pid);
+  }
+
+  res.write(
+    `data: ${JSON.stringify({
+      type: 'user_connected',
+      username,
+      serverBootId: eventBus.bootId,
+      activeProjectIds: [...activeProjectIds],
+      ts: Date.now(),
+    })}\n\n`,
+  );
   const unsubscribe = eventBus.subscribeUser(username, res);
-  res.write(`data: ${JSON.stringify({ type: 'user_connected', username })}\n\n`);
 
   req.on('close', () => {
     unsubscribe();
@@ -585,6 +606,7 @@ app.delete('/api/projects/:id', requireAuth, (req: AuthenticatedRequest, res) =>
   }
   activeChatRuns.delete(row.id);
   piManager.abort(row.id);
+  eventBus.clearProject(row.id);
   // Deleting a conversation thread NEVER deletes the shared Workspace repo & DB tables
   dbStore.deleteProject(row.id);
   eventBus.emitUser(row.owner, { type: 'project_deleted', projectId: row.id });
@@ -644,23 +666,37 @@ app.get('/api/projects/:id/events', requireAuth, (req: AuthenticatedRequest, res
     return;
   }
 
+  req.socket?.setKeepAlive?.(true, 15_000);
+  res.setTimeout?.(0);
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders?.();
 
-  const unsubscribe = eventBus.subscribe(row.id, res);
+  // Compute authoritative handshake snapshot synchronously BEFORE subscribing so zero live events
+  // can slip ahead of `connected`, and every subsequent live event strictly has seq > connected.seq.
+  const enriched = enrichProject(row)!;
+  const msgSummary = dbStore.getProjectMessageSummary(row.id);
+  const currentSeq = eventBus.getSeq(row.id);
+  const activeRun = getActiveRunSnapshot(row.id);
+
   res.write(
     `data: ${JSON.stringify({
       type: 'connected',
       projectId: row.id,
+      serverBootId: eventBus.bootId,
+      projectStatus: enriched.status,
       isBuilding: piManager.isRunning(row.id),
-      activeRun: getActiveRunSnapshot(row.id),
-      seq: eventBus.getSeq(row.id),
+      activeRun,
+      latestMessageId: msgSummary.latestMessageId,
+      messageCount: msgSummary.count,
+      seq: currentSeq,
       ts: Date.now(),
     })}\n\n`,
   );
+
+  const unsubscribe = eventBus.subscribe(row.id, res);
 
   req.on('close', () => {
     unsubscribe();
@@ -1137,7 +1173,9 @@ if (fs.existsSync(config.webDistDir)) {
 }
 
 const server = app.listen(config.port, '0.0.0.0', () => {
-  console.log(`[atoms-server] listening on http://0.0.0.0:${config.port}`);
+  console.log(
+    `[atoms-server] listening on http://0.0.0.0:${config.port} (env=${config.appEnv} publicUrl=${config.publicUrl} cookieSecure=${config.cookieSecure} envFiles=${config.loadedEnvFiles.join(',') || 'none'})`,
+  );
   console.log(
     `[atoms-server] GLM endpoint=${config.glmBaseUrl} model=${config.glmModel} keyConfigured=${Boolean(config.glmApiKey)}`,
   );

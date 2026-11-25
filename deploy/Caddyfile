@@ -1,6 +1,15 @@
-# Default IP-only HTTP mode (zero domain / zero ICP filing required on HK/SG ECS)
-# To enable automatic HTTPS with a domain, replace `:80` with `demo.yourdomain.com`.
-:80 {
+# Production Caddy reverse proxy for Atoms Mini (automatic HTTPS via Let's Encrypt).
+# Standalone host Caddy: proxy to 127.0.0.1:3000
+# Docker Caddy coexisting on the same ECS: proxy to host gateway 172.18.0.1:3000
+atoms.maplink.site {
+    # Exclude SSE streams from compression so heartbeats and agent progress flush immediately
+    @compressible {
+        not path /api/events /api/projects/*/events
+    }
+    encode @compressible zstd gzip
+    request_body {
+        max_size 10MB
+    }
     reverse_proxy 127.0.0.1:3000 {
         # Disable buffering so SSE real-time chat & Coding Agent progress stream immediately
         flush_interval -1

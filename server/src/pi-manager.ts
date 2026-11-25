@@ -135,8 +135,11 @@ interface ActiveRun {
   stepIndexById: Map<string, number>;
   aborted: boolean;
   settled: boolean;
+  lastError?: string;
   stderrBuf: string;
   timeoutTimer: NodeJS.Timeout;
+  idleTimer: NodeJS.Timeout;
+  lastCheckpointAt: number;
   reqSeq: number;
   onSettled: (workspaceId: string, ok: boolean) => Promise<string | null>;
 }
@@ -187,6 +190,17 @@ class PiAgentManager {
 
   getActiveCount(): number {
     return this.activeRuns.size;
+  }
+
+  listActiveProjectIds(owner: string): string[] {
+    const ids = new Set<string>();
+    for (const run of this.activeRuns.values()) {
+      if (run.owner === owner) ids.add(run.projectId);
+    }
+    for (const queued of this.queuedByProject.values()) {
+      if (queued.params.owner === owner) ids.add(queued.params.projectId);
+    }
+    return [...ids];
   }
 
   getWorkspaceBuildState(workspaceId: string): {
@@ -528,6 +542,42 @@ class PiAgentManager {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
+    const abortForTimeout = (reason: 'idle' | 'max', statusText: string, errDetail: string) => {
+      if (run.settled) return;
+      const nowTs = Date.now();
+      const idleMs = nowTs - run.lastActivityAt;
+      const elapsedMs = nowTs - run.startedAt;
+      run.aborted = true;
+      run.lastError = errDetail;
+      run.statusText = statusText;
+      run.lastActivityAt = nowTs;
+      console.warn(
+        `[pi-agent] ${reason}_timeout runId=${run.runId} projectId=${run.projectId} workspaceId=${run.workspaceId} elapsedMs=${elapsedMs} idleMs=${idleMs}`,
+      );
+      run.lastSeq = eventBus.emit(params.projectId, {
+        type: 'agent_status',
+        messageId,
+        statusText,
+      });
+      this.broadcastActivity(run, true);
+      this.writeRpc(child, { id: `abort-${reason}-timeout`, type: 'abort' });
+      setTimeout(() => {
+        if (!run.settled) child.kill('SIGKILL');
+      }, 4000).unref();
+    };
+
+    const scheduleIdleTimer = (): NodeJS.Timeout => {
+      const t = setTimeout(() => {
+        abortForTimeout(
+          'idle',
+          `Agent 连续 ${Math.round(config.agentIdleTimeoutMs / 60000)} 分钟无任何响应，正在终止任务...`,
+          `Agent 空闲超时（超过 ${Math.round(config.agentIdleTimeoutMs / 1000)} 秒无事件输出）`,
+        );
+      }, config.agentIdleTimeoutMs);
+      t.unref();
+      return t;
+    };
+
     const run: ActiveRun = {
       projectId: params.projectId,
       workspaceId: params.workspaceId,
@@ -547,34 +597,31 @@ class PiAgentManager {
       stepIndexById: new Map(),
       aborted: false,
       settled: false,
+      lastError: undefined,
       stderrBuf: '',
+      lastCheckpointAt: now,
       reqSeq: 0,
       onSettled: params.onSettled,
       timeoutTimer: setTimeout(() => {
-        if (!run.settled) {
-          run.aborted = true;
-          const statusText = '构建超过最大耗时限制，正在终止任务...';
-          run.statusText = statusText;
-          run.lastActivityAt = Date.now();
-          run.lastSeq = eventBus.emit(params.projectId, {
-            type: 'agent_status',
-            messageId,
-            statusText,
-          });
-          this.broadcastActivity(run, true);
-          this.writeRpc(child, { id: `abort-timeout`, type: 'abort' });
-          setTimeout(() => {
-            if (!run.settled) child.kill('SIGKILL');
-          }, 4000).unref();
-        }
+        abortForTimeout(
+          'max',
+          `任务达到最大运行耗时上限（${Math.round(config.agentTimeoutMs / 60000)} 分钟），正在收尾终止...`,
+          `任务超过最大耗时上限（${Math.round(config.agentTimeoutMs / 60000)} 分钟）`,
+        );
       }, config.agentTimeoutMs),
+      idleTimer: scheduleIdleTimer(),
     };
+    run.timeoutTimer.unref();
+
+    console.log(
+      `[pi-agent] start runId=${run.runId} projectId=${run.projectId} workspaceId=${run.workspaceId} agent=${run.presetId} model=${config.glmModel} idleTimeoutMs=${config.agentIdleTimeoutMs} maxTimeoutMs=${config.agentTimeoutMs}`,
+    );
 
     this.activeRuns.set(params.projectId, run);
     this.workspaceActiveProject.set(params.workspaceId, params.projectId);
     this.broadcastActivity(run, true);
     this.emitWorkspaceUpdate(params.owner, params.workspaceId, false);
-    this.attachSubprocessHandlers(run);
+    this.attachSubprocessHandlers(run, scheduleIdleTimer);
 
     const agentPrompt = isResearch
       ? params.isInitialBuild
@@ -738,6 +785,7 @@ class PiAgentManager {
   shutdownAll(): void {
     for (const run of this.activeRuns.values()) {
       clearTimeout(run.timeoutTimer);
+      clearTimeout(run.idleTimer);
       try {
         run.child.kill('SIGTERM');
       } catch {
@@ -750,15 +798,39 @@ class PiAgentManager {
     this.queuedByProject.clear();
   }
 
+  private persistCheckpoint(run: ActiveRun, force = false): void {
+    if (run.settled) return;
+    const now = Date.now();
+    if (!force && now - run.lastCheckpointAt < 8_000) return;
+    run.lastCheckpointAt = now;
+    try {
+      dbStore.updateMessage(run.messageId, run.assistantText, {
+        mode: 'build',
+        agentId: run.presetId,
+        thinking: run.thinkingText || undefined,
+        steps: run.steps,
+      });
+    } catch {
+      // non-fatal; final message will still be saved in finalizeRun
+    }
+  }
+
   private writeRpc(child: ChildProcessWithoutNullStreams, payload: Record<string, unknown>): void {
     if (!child.stdin.writable) return;
     child.stdin.write(`${JSON.stringify(payload)}\n`);
   }
 
-  private attachSubprocessHandlers(run: ActiveRun): void {
+  private attachSubprocessHandlers(run: ActiveRun, scheduleIdleTimer: () => NodeJS.Timeout): void {
+    const touchIdleTimer = () => {
+      if (run.settled) return;
+      clearTimeout(run.idleTimer);
+      run.idleTimer = scheduleIdleTimer();
+    };
+
     let stdoutBuf = '';
     run.child.stdout.setEncoding('utf8');
     run.child.stdout.on('data', (chunk: string) => {
+      touchIdleTimer();
       stdoutBuf += chunk;
       let nl = stdoutBuf.indexOf('\n');
       while (nl !== -1) {
@@ -777,20 +849,26 @@ class PiAgentManager {
 
     run.child.stderr.setEncoding('utf8');
     run.child.stderr.on('data', (chunk: string) => {
+      touchIdleTimer();
       run.stderrBuf = (run.stderrBuf + chunk).slice(-4000);
     });
 
     run.child.on('error', (err) => {
+      console.error(`[pi-agent] child_error runId=${run.runId} projectId=${run.projectId} err=${err.message}`);
       void this.finalizeRun(run, 'failed', `启动 Pi 子进程失败: ${err.message}`);
     });
 
-    run.child.on('close', (code) => {
+    run.child.on('close', (code, signal) => {
+      console.log(
+        `[pi-agent] child_close runId=${run.runId} projectId=${run.projectId} code=${code} signal=${signal ?? 'none'} settled=${run.settled} aborted=${run.aborted}`,
+      );
       if (!run.settled) {
-        const status = run.aborted ? 'aborted' : code === 0 ? 'succeeded' : 'failed';
+        const status = run.aborted ? 'aborted' : code === 0 && !run.lastError ? 'succeeded' : 'failed';
         const errMsg =
           status === 'failed'
-            ? `Coding Agent 异常退出 (code=${code})${run.stderrBuf ? `: ${run.stderrBuf.slice(-400)}` : ''}`
-            : undefined;
+            ? run.lastError ||
+              `Coding Agent 异常退出 (code=${code}, signal=${signal ?? 'none'})${run.stderrBuf ? `: ${run.stderrBuf.slice(-400)}` : ''}`
+            : run.lastError;
         void this.finalizeRun(run, status, errMsg);
       }
     });
@@ -838,20 +916,24 @@ class PiAgentManager {
       if (evtType === 'text_delta' && typeof evt.delta === 'string') {
         run.assistantText += evt.delta;
         run.statusText = undefined;
+        run.lastError = undefined;
         run.lastSeq = eventBus.emit(run.projectId, {
           type: 'agent_text_delta',
           messageId: run.messageId,
           delta: evt.delta,
         });
+        this.persistCheckpoint(run, false);
         this.broadcastActivity(run, false);
       } else if (evtType === 'thinking_delta' && typeof evt.delta === 'string') {
         run.thinkingText += evt.delta;
         run.statusText = undefined;
+        run.lastError = undefined;
         run.lastSeq = eventBus.emit(run.projectId, {
           type: 'agent_thinking_delta',
           messageId: run.messageId,
           delta: evt.delta,
         });
+        this.persistCheckpoint(run, false);
         this.broadcastActivity(run, false);
       } else if (evtType === 'toolcall_start') {
         const stepId = String(evt.id || `tc-${run.steps.length + 1}`);
@@ -885,9 +967,104 @@ class PiAgentManager {
           this.broadcastActivity(run, true);
         }
       } else if (evtType === 'error') {
+        // Do NOT kill Pi immediately: Pi has built-in auto-retry (auto_retry_start/end) and
+        // will emit agent_settled if retries are exhausted.
         const err = typeof evt.error === 'string' ? evt.error : JSON.stringify(evt.error || 'Model stream error');
-        void this.finalizeRun(run, run.aborted ? 'aborted' : 'failed', err);
+        run.lastError = err;
+        const statusText = '模型流出现瞬时波动，等待 Agent 自动重试...';
+        run.statusText = statusText;
+        console.warn(`[pi-agent] stream_error runId=${run.runId} projectId=${run.projectId} err=${err.slice(0, 300)}`);
+        run.lastSeq = eventBus.emit(run.projectId, {
+          type: 'agent_status',
+          messageId: run.messageId,
+          statusText,
+        });
+        this.broadcastActivity(run, true);
       }
+      return;
+    }
+
+    if (type === 'message_end') {
+      const msg = record.message as Record<string, unknown> | undefined;
+      if (msg && msg.role === 'assistant') {
+        const stopReason = String(msg.stopReason || '');
+        if (stopReason === 'error') {
+          const errText =
+            typeof msg.errorMessage === 'string' && msg.errorMessage.trim()
+              ? msg.errorMessage.trim()
+              : run.lastError || '模型返回错误';
+          run.lastError = errText;
+          console.warn(
+            `[pi-agent] message_end_error runId=${run.runId} projectId=${run.projectId} err=${errText.slice(0, 300)}`,
+          );
+        } else if (stopReason === 'stop' || stopReason === 'toolUse') {
+          run.lastError = undefined;
+        }
+      }
+      this.persistCheckpoint(run, false);
+      return;
+    }
+
+    if (type === 'auto_retry_start') {
+      const attempt = Number(record.attempt || 1);
+      const maxAttempts = Number(record.maxAttempts || 3);
+      const errMsg = typeof record.errorMessage === 'string' ? record.errorMessage : '';
+      const statusText = `模型服务瞬时波动，正在自动第 ${attempt}/${maxAttempts} 次重试...`;
+      run.statusText = statusText;
+      console.warn(
+        `[pi-agent] auto_retry_start runId=${run.runId} projectId=${run.projectId} attempt=${attempt}/${maxAttempts} err=${errMsg.slice(0, 200)}`,
+      );
+      run.lastSeq = eventBus.emit(run.projectId, {
+        type: 'agent_status',
+        messageId: run.messageId,
+        statusText,
+      });
+      this.broadcastActivity(run, true);
+      return;
+    }
+
+    if (type === 'auto_retry_end') {
+      const success = Boolean(record.success);
+      if (success) {
+        run.lastError = undefined;
+        const statusText = '重试恢复成功，Agent 继续执行任务...';
+        run.statusText = statusText;
+        console.log(`[pi-agent] auto_retry_end runId=${run.runId} projectId=${run.projectId} success=true`);
+        run.lastSeq = eventBus.emit(run.projectId, {
+          type: 'agent_status',
+          messageId: run.messageId,
+          statusText,
+        });
+        this.broadcastActivity(run, true);
+      } else {
+        const finalError =
+          typeof record.finalError === 'string' && record.finalError.trim()
+            ? record.finalError.trim()
+            : run.lastError || '模型自动重试均失败';
+        run.lastError = finalError;
+        console.error(
+          `[pi-agent] auto_retry_end runId=${run.runId} projectId=${run.projectId} success=false err=${finalError.slice(0, 300)}`,
+        );
+      }
+      return;
+    }
+
+    if (type === 'compaction_start') {
+      const statusText = '对话上下文较长，正在自动压缩整理记忆后继续执行...';
+      run.statusText = statusText;
+      console.log(`[pi-agent] compaction_start runId=${run.runId} projectId=${run.projectId}`);
+      run.lastSeq = eventBus.emit(run.projectId, {
+        type: 'agent_status',
+        messageId: run.messageId,
+        statusText,
+      });
+      this.broadcastActivity(run, true);
+      return;
+    }
+
+    if (type === 'compaction_end') {
+      run.statusText = undefined;
+      console.log(`[pi-agent] compaction_end runId=${run.runId} projectId=${run.projectId} aborted=${Boolean(record.aborted)}`);
       return;
     }
 
@@ -956,6 +1133,7 @@ class PiAgentManager {
           status: run.steps[idx].status,
           output,
         });
+        this.persistCheckpoint(run, true);
         this.broadcastActivity(run, true);
       }
       return;
@@ -977,8 +1155,14 @@ class PiAgentManager {
     }
 
     if (type === 'agent_settled') {
-      const status = run.aborted ? 'aborted' : 'succeeded';
-      void this.finalizeRun(run, status);
+      const isAborted = run.aborted || Boolean(record.aborted);
+      if (isAborted) {
+        void this.finalizeRun(run, 'aborted', run.lastError);
+      } else if (run.lastError) {
+        void this.finalizeRun(run, 'failed', run.lastError);
+      } else {
+        void this.finalizeRun(run, 'succeeded');
+      }
     }
   }
 
@@ -990,6 +1174,7 @@ class PiAgentManager {
     if (run.settled) return;
     run.settled = true;
     clearTimeout(run.timeoutTimer);
+    clearTimeout(run.idleTimer);
 
     try {
       run.child.stdin.end();
@@ -1027,12 +1212,18 @@ class PiAgentManager {
     const finalContent =
       run.assistantText.trim() ||
       (status === 'aborted'
-        ? '已停止本次任务。你可以继续输入新的需求或修改意见。'
+        ? error
+          ? `任务已终止：${error}。你可以继续输入新的需求或重试。`
+          : '已停止本次任务。你可以继续输入新的需求或修改意见。'
         : status === 'failed'
           ? `执行过程中遇到错误：${error || '未知错误'}`
           : isResearch
             ? '深度研究报告已生成！你可以在右侧「研究报告」面板查看完整内容与参考信源。'
             : '全栈项目构建完成！你可以在右侧预览并与应用交互。');
+
+    console.log(
+      `[pi-agent] finalized runId=${run.runId} projectId=${run.projectId} workspaceId=${run.workspaceId} status=${status} durationMs=${Date.now() - run.startedAt} steps=${run.steps.length} preview=${Boolean(previewUrl)}${error ? ` err=${error.slice(0, 240)}` : ''}`,
+    );
 
     const metadata: MessageMetadata = {
       mode: 'build',

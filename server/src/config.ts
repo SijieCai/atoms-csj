@@ -7,7 +7,53 @@ import dotenv from 'dotenv';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.resolve(__dirname, '../..');
 
-dotenv.config({ path: path.join(REPO_ROOT, '.env') });
+export type AppEnv = 'development' | 'production';
+
+function resolveAppEnv(): AppEnv {
+  const raw = (process.env.APP_ENV || process.env.NODE_ENV || 'development').trim().toLowerCase();
+  return raw === 'production' || raw === 'prod' ? 'production' : 'development';
+}
+
+const appEnv = resolveAppEnv();
+
+// Layered env loading (highest precedence first; existing process.env keys are never overwritten):
+//   1. Process environment (CLI / systemd)
+//   2. .env.<appEnv>.local (machine-specific private overrides, gitignored)
+//   3. .env.<appEnv>       (checked-in env defaults: .env.development / .env.production)
+//   4. .env.local          (shared private overrides, gitignored)
+//   5. .env                (shared secrets & fallback config, gitignored, synced on deploy)
+const envFilesToLoad = [
+  `.env.${appEnv}.local`,
+  `.env.${appEnv}`,
+  '.env.local',
+  '.env',
+];
+
+const loadedEnvFiles: string[] = [];
+for (const filename of envFilesToLoad) {
+  const fullPath = path.join(REPO_ROOT, filename);
+  if (fs.existsSync(fullPath)) {
+    dotenv.config({ path: fullPath, override: false });
+    loadedEnvFiles.push(filename);
+  }
+}
+
+function parseBooleanEnv(raw: string | undefined, fallback: boolean): boolean {
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const norm = raw.trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(norm)) return true;
+  if (['0', 'false', 'no', 'off'].includes(norm)) return false;
+  return fallback;
+}
+
+function parseTrustProxy(raw: string | undefined, isProd: boolean): number | boolean {
+  if (raw === undefined || raw.trim() === '') return isProd ? 1 : false;
+  const trimmed = raw.trim().toLowerCase();
+  if (trimmed === 'false' || trimmed === '0' || trimmed === 'off') return false;
+  if (trimmed === 'true' || trimmed === 'on') return true;
+  const num = Number(trimmed);
+  return Number.isFinite(num) && num > 0 ? num : isProd ? 1 : false;
+}
 
 function parseDemoUsers(raw: string): Map<string, string> {
   const map = new Map<string, string>();
@@ -25,6 +71,26 @@ function parseDemoUsers(raw: string): Map<string, string> {
   return map;
 }
 
+const isProd = appEnv === 'production';
+const port = Number(process.env.PORT || 3000);
+
+const publicDomain = (
+  process.env.PUBLIC_DOMAIN || (isProd ? 'atoms.maplink.site' : `localhost:${port}`)
+).trim();
+
+const publicUrl = (
+  process.env.PUBLIC_URL ||
+  (isProd ? `https://${publicDomain}` : `http://${publicDomain}`)
+)
+  .trim()
+  .replace(/\/+$/, '');
+
+const cookieSecure = parseBooleanEnv(
+  process.env.COOKIE_SECURE,
+  isProd && publicUrl.startsWith('https://'),
+);
+const trustProxy = parseTrustProxy(process.env.TRUST_PROXY, isProd);
+
 const rawDataDir = process.env.DATA_DIR || './data';
 const dataDir = path.isAbsolute(rawDataDir)
   ? rawDataDir
@@ -41,12 +107,19 @@ const demoUsers = parseDemoUsers(
 const sessionSecret =
   process.env.SESSION_SECRET && process.env.SESSION_SECRET !== 'change-me-to-a-long-random-secret-in-production'
     ? process.env.SESSION_SECRET
-    : crypto.createHash('sha256').update(`atoms-dev-secret:${REPO_ROOT}`).digest('hex');
+    : crypto.createHash('sha256').update(`atoms-${appEnv}-secret:${REPO_ROOT}`).digest('hex');
 
 export const config = {
-  port: Number(process.env.PORT || 3000),
-  nodeEnv: process.env.NODE_ENV || 'development',
-  isProd: process.env.NODE_ENV === 'production',
+  port,
+  appEnv,
+  nodeEnv: isProd ? 'production' : 'development',
+  isProd,
+  loadedEnvFiles,
+  publicDomain,
+  publicUrl,
+  cookieSecure,
+  trustProxy,
+
   repoRoot: REPO_ROOT,
   dataDir,
   platformDbPath: path.join(dataDir, 'platform.db'),
@@ -58,7 +131,7 @@ export const config = {
   templatesDir: path.join(REPO_ROOT, 'templates'),
   templateDir: path.join(REPO_ROOT, 'templates', 'fullstack-app'),
   webDistDir: path.join(REPO_ROOT, 'web', 'dist'),
-  internalBaseUrl: `http://127.0.0.1:${Number(process.env.PORT || 3000)}`,
+  internalBaseUrl: `http://127.0.0.1:${port}`,
 
   demoUsers,
   sessionSecret,
@@ -71,7 +144,8 @@ export const config = {
   tavilyApiKey: (process.env.TAVILY_API_KEY || '').trim(),
   firecrawlApiKey: (process.env.FIRECRAWL_API_KEY || '').trim(),
 
-  agentTimeoutMs: Number(process.env.AGENT_TIMEOUT_MS || 480_000),
+  agentTimeoutMs: Number(process.env.AGENT_TIMEOUT_MS || 1_800_000),
+  agentIdleTimeoutMs: Number(process.env.AGENT_IDLE_TIMEOUT_MS || 300_000),
   maxConcurrentAgents: Number(process.env.MAX_CONCURRENT_AGENTS || 2),
   previewPortStart: Number(process.env.PREVIEW_PORT_START || 14_000),
   previewPortEnd: Number(process.env.PREVIEW_PORT_END || 14_200),

@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import type { AgentPresetSummary, FileTreeNode, TableInfoDTO, WorkspaceDTO } from '@atoms/shared';
 import { api } from '../api';
+import { getPublicOrigin } from '../env';
 import { CodeEditorIDE } from './CodeEditorIDE';
 
 export type WorkspaceTabKey = 'preview' | 'code' | 'database' | 'logs';
@@ -78,7 +79,7 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
     tableCount: number;
   } | null>(null);
 
-  const shareUrl = `${window.location.origin}${workspace.previewUrl}`;
+  const shareUrl = `${getPublicOrigin()}${workspace.previewUrl}`;
   const workspaceBusy = Boolean(workspace.activeBuildProjectId) || isBuilding;
 
   useEffect(() => {

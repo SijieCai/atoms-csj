@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Sparkles, Lock, User, ArrowRight, Database, Terminal } from 'lucide-react';
 import { api } from '../api';
+import { IS_PROD } from '../env';
 
 interface LoginPageProps {
   onSuccess: (username: string) => void;
@@ -35,7 +36,14 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onSuccess }) => {
             <Sparkles className="w-6 h-6" />
           </div>
           <div>
-            <h1 className="text-xl font-bold text-slate-900 tracking-tight">Atoms Mini</h1>
+            <div className="flex items-center gap-2">
+              <h1 className="text-xl font-bold text-slate-900 tracking-tight">Atoms Mini</h1>
+              {!IS_PROD && (
+                <span className="text-[10px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-200">
+                  DEV
+                </span>
+              )}
+            </div>
             <p className="text-xs text-slate-500">AI 全栈应用构建与在线预览 Demo</p>
           </div>
         </div>

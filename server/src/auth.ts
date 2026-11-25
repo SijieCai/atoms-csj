@@ -64,14 +64,19 @@ export function setSessionCookie(res: Response, username: string): void {
   res.cookie(COOKIE_NAME, token, {
     httpOnly: true,
     sameSite: 'lax',
-    secure: false, // works over plain HTTP IP demos as well as HTTPS behind Caddy
+    secure: config.cookieSecure,
     maxAge: SESSION_TTL_MS,
     path: '/',
   });
 }
 
 export function clearSessionCookie(res: Response): void {
-  res.clearCookie(COOKIE_NAME, { path: '/' });
+  res.clearCookie(COOKIE_NAME, {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: config.cookieSecure,
+    path: '/',
+  });
 }
 
 export function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction): void {

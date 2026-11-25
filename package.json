@@ -8,11 +8,14 @@
     "web"
   ],
   "scripts": {
-    "dev": "npm --workspace=shared run build && concurrently -k -n server,web -c cyan,magenta \"npm --workspace=server run dev\" \"npm --workspace=web run dev\"",
+    "dev": "APP_ENV=development NODE_ENV=development npm --workspace=shared run build && concurrently -k -n server,web -c cyan,magenta \"APP_ENV=development NODE_ENV=development npm --workspace=server run dev\" \"npm --workspace=web run dev\"",
     "build": "npm --workspace=shared run build && npm --workspace=web run build && npm --workspace=server run build",
-    "start": "npm --workspace=server run start",
+    "build:prod": "APP_ENV=production NODE_ENV=production npm run build",
+    "start": "APP_ENV=production NODE_ENV=production npm --workspace=server run start",
+    "start:dev": "APP_ENV=development NODE_ENV=development npm --workspace=server run start",
     "typecheck": "npm --workspace=shared run build && npm --workspace=server run typecheck && npm --workspace=web run typecheck",
-    "setup:template": "npm --prefix templates/fullstack-app install --no-audit --no-fund"
+    "setup:template": "npm --prefix templates/fullstack-app install --no-audit --no-fund",
+    "deploy:ecs": "bash deploy/deploy-ecs.sh"
   },
   "devDependencies": {
     "concurrently": "^9.1.2"
