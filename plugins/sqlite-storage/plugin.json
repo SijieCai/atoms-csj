@@ -1,0 +1,19 @@
+{
+  "id": "sqlite-storage",
+  "name": "SQLite 隔离存储代理",
+  "version": "1.0.0",
+  "description": "通过平台 DB Proxy 提供按用户名前缀隔离的 SQLite 建表与 SQL 执行能力（包含 Skill、MCP 工具和运行时 SDK）。",
+  "skillDir": ".",
+  "mcp": {
+    "serverName": "atoms_db",
+    "entry": "mcp-server.mjs",
+    "exposure": "direct",
+    "description": "Create user-prefixed SQLite tables and run isolated SQL queries via Atoms DB Proxy"
+  },
+  "envNeeds": [
+    "ATOMS_DB_PROXY_URL",
+    "ATOMS_DB_TOKEN",
+    "ATOMS_DB_PREFIX"
+  ],
+  "systemPromptAppend": "本工作区已加载插件 [sqlite-storage]（含 Skill atoms-sqlite-storage 与 MCP 工具 atoms_db）。所有数据表必须通过 atoms_db MCP 工具或应用内的 ./db.js 代理客户端创建和读写，代理会自动为表名加上用户名前缀实现租户隔离。禁止直接用 node:sqlite 或 fs 打开本地数据库文件。"
+}

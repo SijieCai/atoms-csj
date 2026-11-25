@@ -1,0 +1,9 @@
+[
+  {
+    "id": "fullstack-web",
+    "name": "全栈网站 Agent",
+    "description": "预置 React + Express 全栈模板，挂载用户隔离 SQLite 存储代理插件（Skill + MCP + 运行时 SDK）。",
+    "templateId": "fullstack-app",
+    "plugins": ["sqlite-storage"]
+  }
+]

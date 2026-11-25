@@ -1,0 +1,8 @@
+# Default IP-only HTTP mode (zero domain / zero ICP filing required on HK/SG ECS)
+# To enable automatic HTTPS with a domain, replace `:80` with `demo.yourdomain.com`.
+:80 {
+    reverse_proxy 127.0.0.1:3000 {
+        # Disable buffering so SSE real-time chat & Coding Agent progress stream immediately
+        flush_interval -1
+    }
+}

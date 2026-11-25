@@ -1,0 +1,16 @@
+[Unit]
+Description=Atoms Mini Full-Stack AI Builder
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/atoms
+Environment=NODE_ENV=production
+EnvironmentFile=/opt/atoms/.env
+ExecStart=/usr/bin/node /opt/atoms/server/dist/index.js
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

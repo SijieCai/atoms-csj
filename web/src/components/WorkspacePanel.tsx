@@ -1,0 +1,413 @@
+import React, { useCallback, useEffect, useState } from 'react';
+import {
+  Globe,
+  Code2,
+  TerminalSquare,
+  RefreshCw,
+  ExternalLink,
+  Copy,
+  Check,
+  RotateCcw,
+  Database,
+  Loader2,
+  Puzzle,
+  Table2,
+} from 'lucide-react';
+import type { AgentPresetSummary, FileTreeNode, ProjectDTO, TableInfoDTO } from '@atoms/shared';
+import { api } from '../api';
+import { CodeEditorIDE } from './CodeEditorIDE';
+
+interface WorkspacePanelProps {
+  project: ProjectDTO;
+  previewRevision: number;
+  isBuilding: boolean;
+}
+
+type TabKey = 'preview' | 'code' | 'database' | 'logs';
+
+export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
+  project,
+  previewRevision,
+  isBuilding,
+}) => {
+  const [tab, setTab] = useState<TabKey>('preview');
+  const [iframeNonce, setIframeNonce] = useState(0);
+  const [copied, setCopied] = useState(false);
+  const [restarting, setRestarting] = useState(false);
+
+  const [files, setFiles] = useState<FileTreeNode[]>([]);
+
+  const [tablesInfo, setTablesInfo] = useState<{
+    prefix: string;
+    preset?: AgentPresetSummary;
+    tables: TableInfoDTO[];
+  } | null>(null);
+  const [selectedTable, setSelectedTable] = useState<string | null>(null);
+  const [tableRows, setTableRows] = useState<Record<string, unknown>[]>([]);
+  const [loadingRows, setLoadingRows] = useState(false);
+
+  const [logsInfo, setLogsInfo] = useState<{
+    running: boolean;
+    port: number | null;
+    logs: string[];
+    hasDb: boolean;
+    tableCount: number;
+  } | null>(null);
+
+  const shareUrl = project.previewUrl ? `${window.location.origin}${project.previewUrl}` : '';
+
+  const loadFiles = useCallback(async () => {
+    try {
+      const res = await api.listFiles(project.id);
+      setFiles(res.files);
+    } catch {
+      // ignore
+    }
+  }, [project.id]);
+
+  const loadTables = useCallback(async () => {
+    try {
+      const res = await api.getTables(project.id);
+      setTablesInfo(res);
+    } catch {
+      // ignore
+    }
+  }, [project.id]);
+
+  const loadLogs = useCallback(async () => {
+    try {
+      const res = await api.getLogs(project.id);
+      setLogsInfo(res);
+    } catch {
+      // ignore
+    }
+  }, [project.id]);
+
+  useEffect(() => {
+    setSelectedTable(null);
+    setTableRows([]);
+    setIframeNonce((n) => n + 1);
+    void loadFiles();
+    void loadTables();
+    void loadLogs();
+  }, [project.id, previewRevision, loadFiles, loadTables, loadLogs]);
+
+  useEffect(() => {
+    if (tab === 'code') void loadFiles();
+    if (tab === 'database') void loadTables();
+    if (tab === 'logs') void loadLogs();
+  }, [tab, loadFiles, loadTables, loadLogs]);
+
+  const handleInspectTable = async (logicalName: string) => {
+    setSelectedTable(logicalName);
+    setLoadingRows(true);
+    try {
+      const res = await api.getTableRows(project.id, logicalName);
+      setTableRows(res.rows);
+    } catch {
+      setTableRows([]);
+    } finally {
+      setLoadingRows(false);
+    }
+  };
+
+  const handleCopyShare = async () => {
+    if (!shareUrl) return;
+    try {
+      await navigator.clipboard.writeText(shareUrl);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1800);
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleRestart = async () => {
+    setRestarting(true);
+    try {
+      await api.restartPreview(project.id);
+      setIframeNonce((n) => n + 1);
+      await Promise.all([loadLogs(), loadTables(), loadFiles()]);
+    } catch (err) {
+      alert(err instanceof Error ? err.message : '重启预览失败');
+    } finally {
+      setRestarting(false);
+    }
+  };
+
+  return (
+    <section
+      className={`${
+        tab === 'code' ? 'w-[58%] max-w-[1040px]' : 'w-[48%] max-w-[840px]'
+      } min-w-[460px] border-l border-slate-200 bg-slate-50 flex flex-col shrink-0 transition-[width] duration-150`}
+    >
+      {/* Tab Bar */}
+      <div className="h-13 px-3 border-b border-slate-200 bg-white flex items-center justify-between gap-2 shrink-0">
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            onClick={() => setTab('preview')}
+            className={`px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition cursor-pointer ${
+              tab === 'preview' ? 'bg-indigo-50 text-indigo-700' : 'text-slate-600 hover:bg-slate-100'
+            }`}
+          >
+            <Globe className="w-3.5 h-3.5" />
+            预览
+          </button>
+          <button
+            type="button"
+            onClick={() => setTab('code')}
+            className={`px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition cursor-pointer ${
+              tab === 'code' ? 'bg-indigo-50 text-indigo-700' : 'text-slate-600 hover:bg-slate-100'
+            }`}
+          >
+            <Code2 className="w-3.5 h-3.5" />
+            VS Code
+          </button>
+          <button
+            type="button"
+            onClick={() => setTab('database')}
+            className={`px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition cursor-pointer ${
+              tab === 'database' ? 'bg-indigo-50 text-indigo-700' : 'text-slate-600 hover:bg-slate-100'
+            }`}
+          >
+            <Database className="w-3.5 h-3.5" />
+            数据表
+            {tablesInfo && tablesInfo.tables.length > 0 && (
+              <span className="px-1.5 py-0.2 rounded-full bg-emerald-100 text-emerald-700 text-[10px]">
+                {tablesInfo.tables.length}
+              </span>
+            )}
+          </button>
+          <button
+            type="button"
+            onClick={() => setTab('logs')}
+            className={`px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition cursor-pointer ${
+              tab === 'logs' ? 'bg-indigo-50 text-indigo-700' : 'text-slate-600 hover:bg-slate-100'
+            }`}
+          >
+            <TerminalSquare className="w-3.5 h-3.5" />
+            日志
+          </button>
+        </div>
+
+        <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            disabled={restarting || isBuilding}
+            onClick={() => void handleRestart()}
+            title="重新编译并重启应用预览"
+            className="p-1.5 rounded-lg text-slate-500 hover:text-slate-800 hover:bg-slate-100 disabled:opacity-40 transition cursor-pointer"
+          >
+            <RotateCcw className={`w-3.5 h-3.5 ${restarting ? 'animate-spin' : ''}`} />
+          </button>
+        </div>
+      </div>
+
+      {/* Preview Tab */}
+      {tab === 'preview' && (
+        <div className="flex-1 flex flex-col min-h-0">
+          {project.previewUrl && (
+            <div className="px-3 py-2 bg-slate-100/80 border-b border-slate-200 flex items-center gap-2">
+              <div className="flex-1 bg-white border border-slate-200 rounded-lg px-2.5 py-1 text-xs text-slate-600 font-mono truncate">
+                {shareUrl}
+              </div>
+              <button
+                type="button"
+                onClick={() => setIframeNonce((n) => n + 1)}
+                title="刷新预览"
+                className="p-1.5 rounded-lg bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 cursor-pointer"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleCopyShare()}
+                title="复制免登录分享链接"
+                className="px-2.5 py-1.5 rounded-lg bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 text-xs flex items-center gap-1 cursor-pointer"
+              >
+                {copied ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                {copied ? '已复制' : '分享'}
+              </button>
+              <a
+                href={project.previewUrl}
+                target="_blank"
+                rel="noreferrer"
+                title="在新标签页打开"
+                className="p-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white"
+              >
+                <ExternalLink className="w-3.5 h-3.5" />
+              </a>
+            </div>
+          )}
+
+          <div className="flex-1 relative bg-white min-h-0">
+            {isBuilding ? (
+              <div className="h-full flex flex-col items-center justify-center p-8 text-center">
+                <Loader2 className="w-8 h-8 text-indigo-600 animate-spin mb-3" />
+                <div className="text-sm font-medium text-slate-800">云端 Coding Agent 正在构建你的全栈应用...</div>
+                <p className="mt-1 text-xs text-slate-500">
+                  已挂载 SQLite 隔离代理插件（Skill + MCP），完成后自动启动预览
+                </p>
+              </div>
+            ) : project.previewUrl ? (
+              <iframe
+                key={`${project.id}-${previewRevision}-${iframeNonce}`}
+                src={`${project.previewUrl}?_r=${previewRevision}_${iframeNonce}`}
+                title="Atoms App Preview"
+                className="w-full h-full border-0"
+              />
+            ) : (
+              <div className="h-full flex items-center justify-center text-xs text-slate-400">
+                构建完成后将在此处展示实时可交互预览
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* VS Code (Monaco + Server LSP) Tab */}
+      {tab === 'code' && (
+        <CodeEditorIDE
+          projectId={project.id}
+          files={files}
+          onRefreshFiles={loadFiles}
+          onRebuildPreview={handleRestart}
+        />
+      )}
+
+      {/* Database & Plugin Isolation Tab */}
+      {tab === 'database' && (
+        <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+          <div className="px-3.5 py-2.5 bg-white border-b border-slate-200 space-y-2">
+            <div className="flex items-center justify-between gap-2 text-xs">
+              <div className="flex items-center gap-1.5 text-slate-700 font-medium">
+                <Puzzle className="w-3.5 h-3.5 text-indigo-600" />
+                <span>{tablesInfo?.preset?.name || '全栈网站 Agent'}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => void loadTables()}
+                className="text-indigo-600 hover:underline cursor-pointer"
+              >
+                刷新表结构
+              </button>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+              <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-600 font-mono">
+                隔离前缀: {tablesInfo?.prefix || project.tablePrefix}
+              </span>
+              {tablesInfo?.preset?.plugins.map((pl) => (
+                <span
+                  key={pl.id}
+                  className="px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200"
+                >
+                  插件: {pl.id}
+                  {pl.hasSkill ? ' · Skill' : ''}
+                  {pl.mcpServerName ? ` · MCP(${pl.mcpServerName})` : ''}
+                </span>
+              ))}
+            </div>
+          </div>
+
+          <div className="flex-1 overflow-y-auto p-3 space-y-3">
+            {!tablesInfo || tablesInfo.tables.length === 0 ? (
+              <div className="bg-white rounded-xl border border-slate-200 p-6 text-center text-xs text-slate-500">
+                当前命名空间尚未建表。Agent 构建时会自动通过 <code className="font-mono">atoms_db</code> 代理建表，所有物理表名均自动带有用户前缀{' '}
+                <code className="font-mono text-indigo-700">{project.tablePrefix}</code>。
+              </div>
+            ) : (
+              tablesInfo.tables.map((tbl) => {
+                const isSelected = selectedTable === tbl.logicalName;
+                return (
+                  <div
+                    key={tbl.physicalName}
+                    className="bg-white rounded-xl border border-slate-200 overflow-hidden"
+                  >
+                    <div className="px-3.5 py-2.5 flex items-center justify-between gap-2 border-b border-slate-100">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-1.5">
+                          <Table2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                          <span className="text-xs font-semibold text-slate-900 font-mono">
+                            {tbl.logicalName}
+                          </span>
+                          <span className="text-[11px] text-slate-400">({tbl.rowCount} 行)</span>
+                        </div>
+                        <div className="text-[11px] text-slate-400 font-mono truncate mt-0.5">
+                          物理表名: {tbl.physicalName}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => void handleInspectTable(tbl.logicalName)}
+                        className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-indigo-50 hover:text-indigo-700 text-slate-700 text-[11px] font-medium transition cursor-pointer shrink-0"
+                      >
+                        {isSelected ? '刷新数据' : '查看数据'}
+                      </button>
+                    </div>
+
+                    <div className="px-3.5 py-2 flex flex-wrap gap-1.5 bg-slate-50/70">
+                      {tbl.columns.map((c) => (
+                        <span
+                          key={c.name}
+                          className="text-[11px] font-mono px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-700"
+                        >
+                          {c.name}
+                          <span className="text-slate-400 ml-1">{c.type}</span>
+                          {c.primaryKey && <span className="text-amber-600 ml-1">PK</span>}
+                        </span>
+                      ))}
+                    </div>
+
+                    {isSelected && (
+                      <div className="border-t border-slate-200 bg-slate-950 text-slate-200 p-2.5 overflow-x-auto max-h-56">
+                        {loadingRows ? (
+                          <div className="text-[11px] text-slate-400">查询中...</div>
+                        ) : tableRows.length === 0 ? (
+                          <div className="text-[11px] text-slate-400">表内暂无记录</div>
+                        ) : (
+                          <pre className="text-[11px] font-mono whitespace-pre-wrap break-all">
+                            {JSON.stringify(tableRows, null, 2)}
+                          </pre>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Logs Tab */}
+      {tab === 'logs' && (
+        <div className="flex-1 flex flex-col min-h-0">
+          <div className="px-3 py-2 border-b border-slate-200 bg-white flex items-center justify-between text-xs">
+            <div className="flex items-center gap-2 text-slate-600">
+              <span
+                className={`w-2 h-2 rounded-full ${logsInfo?.running ? 'bg-emerald-500' : 'bg-slate-300'}`}
+              />
+              <span>
+                {logsInfo?.running
+                  ? `运行中 (内部端口 ${logsInfo.port})`
+                  : '未运行（访问预览时按需自动启动）'}
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => void loadLogs()}
+              className="text-indigo-600 hover:underline cursor-pointer"
+            >
+              刷新日志
+            </button>
+          </div>
+          <pre className="flex-1 bg-slate-950 text-slate-200 p-3 text-[11px] font-mono overflow-auto whitespace-pre-wrap break-all">
+            {logsInfo?.logs.length ? logsInfo.logs.join('\n') : '暂无运行日志'}
+          </pre>
+        </div>
+      )}
+    </section>
+  );
+};
