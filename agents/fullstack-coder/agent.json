@@ -8,6 +8,13 @@
   "templateId": "fullstack-app",
   "plugins": ["sqlite-storage"],
   "systemPromptFile": "SYSTEM.md",
+  "budget": {
+    "maxDurationMs": 720000,
+    "maxCostCny": 5.0,
+    "maxTokens": 500000,
+    "maxToolCalls": 45,
+    "softWarnRatio": 0.75
+  },
   "intent": {
     "description": "用户希望创建、开发、编写、修改或修复一个可交互的网站、全栈应用、页面、后台工具、数据看板或数据库功能；或确认先前讨论的建站方案。",
     "keywords": [

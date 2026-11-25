@@ -10,17 +10,32 @@ import {
   Brain,
   Wrench,
   Database,
+  Gauge,
+  AlertTriangle,
 } from 'lucide-react';
-import type { AgentToolStep } from '@atoms/shared';
+import type { AgentBudgetSnapshot, AgentToolStep, AgentUsageStats } from '@atoms/shared';
 
 interface AgentStepCardProps {
   thinking?: string;
   steps?: AgentToolStep[];
   statusText?: string;
+  usage?: AgentUsageStats;
+  budget?: AgentBudgetSnapshot;
   isRunning?: boolean;
   isQueued?: boolean;
   startedAt?: number;
   lastActivityAt?: number;
+}
+
+function formatTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
+
+function formatCny(cny: number): string {
+  if (cny < 0.01) return `¥${cny.toFixed(4)}`;
+  return `¥${cny.toFixed(2)}`;
 }
 
 function formatDuration(ms: number): string {
@@ -55,6 +70,8 @@ export const AgentStepCard: React.FC<AgentStepCardProps> = ({
   thinking,
   steps = [],
   statusText,
+  usage,
+  budget,
   isRunning,
   isQueued,
   startedAt,
@@ -71,13 +88,27 @@ export const AgentStepCard: React.FC<AgentStepCardProps> = ({
     return () => window.clearInterval(timer);
   }, [isRunning]);
 
-  if (!thinking && steps.length === 0 && !statusText && !isRunning) {
+  if (!thinking && steps.length === 0 && !statusText && !isRunning && !usage) {
     return null;
   }
 
   const idleMs = lastActivityAt ? Math.max(0, now - lastActivityAt) : 0;
-  const elapsedMs = startedAt ? Math.max(0, now - startedAt) : 0;
+  const elapsedMs = isRunning && startedAt ? Math.max(0, now - startedAt) : usage?.elapsedMs ?? 0;
   const isRecentlyActive = idleMs < 20_000;
+
+  const budgetMaxRatio =
+    usage && budget
+      ? Math.min(
+          1,
+          Math.max(
+            elapsedMs / budget.limits.maxDurationMs,
+            usage.estimatedCostCny / budget.limits.maxCostCny,
+            usage.totalTokens / budget.limits.maxTokens,
+            usage.toolCalls / budget.limits.maxToolCalls,
+          ),
+        )
+      : 0;
+  const budgetPct = Math.round(budgetMaxRatio * 100);
 
   return (
     <div className="mb-3 space-y-2">
@@ -174,6 +205,65 @@ export const AgentStepCard: React.FC<AgentStepCardProps> = ({
                   {formatAgo(idleMs)}
                 </span>
               )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {usage && budget && !isQueued && (
+        <div
+          className={`rounded-lg px-3 py-1.5 border text-[11px] ${
+            budget.exceededReason
+              ? 'bg-rose-50/80 border-rose-200 text-rose-800'
+              : budget.softWarned
+                ? 'bg-amber-50/80 border-amber-200 text-amber-900'
+                : 'bg-slate-50/80 border-slate-200/80 text-slate-600'
+          }`}
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-1.5 font-medium">
+              {budget.exceededReason || budget.softWarned ? (
+                <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+              ) : (
+                <Gauge className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+              )}
+              <span>
+                {budget.exceededReason
+                  ? `预算保护终止：${budget.exceededReason}`
+                  : budget.softWarned
+                    ? '接近预算上限，已通知 Agent 收口'
+                    : isRunning
+                      ? '运行预算监控'
+                      : '本次执行消耗'}
+              </span>
+            </div>
+            <div className="flex flex-wrap items-center gap-2.5 font-mono text-[10px]">
+              <span>
+                耗时 {formatDuration(elapsedMs)}/{formatDuration(budget.limits.maxDurationMs)}
+              </span>
+              <span>
+                步数 {usage.toolCalls}/{budget.limits.maxToolCalls}
+              </span>
+              <span>
+                Tokens {formatTokens(usage.totalTokens)}/{formatTokens(budget.limits.maxTokens)}
+              </span>
+              <span>
+                估算 {formatCny(usage.estimatedCostCny)}/{formatCny(budget.limits.maxCostCny)}
+              </span>
+            </div>
+          </div>
+          {isRunning && (
+            <div className="mt-1.5 h-1 w-full rounded-full bg-slate-200/80 overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all duration-500 ${
+                  budget.exceededReason
+                    ? 'bg-rose-500'
+                    : budget.softWarned || budgetPct >= 75
+                      ? 'bg-amber-500'
+                      : 'bg-indigo-500'
+                }`}
+                style={{ width: `${Math.max(4, Math.min(100, budgetPct))}%` }}
+              />
             </div>
           )}
         </div>

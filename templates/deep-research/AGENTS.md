@@ -19,11 +19,11 @@ This workspace mounts the `deep-research` plugin (Skill `deep-research` + MCP se
 ## Mandatory Rules
 1. **Stay strictly inside this workspace directory**. Never read or modify files outside the current working directory.
 2. **Never fabricate URLs, statistics, or citations**. Every `[n]` in `report.md` and every entry in `sources.json` must come directly from tool outputs returned in this session.
-3. **Follow the 4-phase workflow**:
+3. **Follow the budget-aware 4-phase workflow**:
    - Phase 1: Write `plan.md` with scope, sub-questions, and evaluation dimensions.
-   - Phase 2: Run diverse `web_search` queries (including primary sources and counter-arguments).
-   - Phase 3: Use `web_fetch` / `web_crawl` to inspect primary sources directly, save notes to `sources/`, and write `sources.json`.
-   - Phase 4: Write the comprehensive, cited `report.md` (Executive Summary first, structured Markdown tables, confidence ratings, disagreements/caveats, recommendations, and References).
+   - Phase 2: Run **3–6 diverse** `web_search` queries (results are auto-archived to `sources/00-search-digest.md` and `sources.json`).
+   - Phase 3: Use `web_fetch` / `web_crawl` on **4–8 highest-value primary sources** (each fetched page is auto-archived to `sources/NN-*.md` and `sources.json` with extracted summary).
+   - Phase 4: Promptly write the comprehensive, cited `report.md` (Executive Summary first, structured Markdown tables, confidence ratings, disagreements/caveats, recommendations, and References). If a budget warning arrives, stop searching immediately and write `report.md` from archived sources!
 4. **Always verify before finishing**:
    - Confirm `report.md` is non-empty and properly formatted.
    - Confirm `sources.json` is valid JSON (`node -e "JSON.parse(require('fs').readFileSync('sources.json','utf8'))"`).

@@ -415,18 +415,21 @@
               const title = escapeHtml(s.title || s.url || 'Untitled Source');
               const domain = escapeHtml(s.domain || '');
               const type = escapeHtml(s.type || 'web');
+              const statusLabel = s.status === 'fetched' ? '已精读' : s.status === 'snippet' ? '检索摘要' : '';
               const rel = escapeHtml(s.reliability || '');
               const pub = escapeHtml(s.publishedAt || '');
+              const noteFile = escapeHtml(s.noteFile || '');
               const summary = escapeHtml(s.summary || '');
               return `
                 <div class="source-item" id="source-${id}">
                   <div class="source-head">
                     <a class="source-title" href="${url}" target="_blank" rel="noopener noreferrer">[${id}] ${title}</a>
-                    <span class="badge">${type}${rel ? ' · ' + rel : ''}</span>
+                    <span class="badge">${statusLabel ? statusLabel + ' · ' : ''}${type}${rel ? ' · ' + rel : ''}</span>
                   </div>
                   <div class="source-meta">
                     ${domain ? `<span>🌐 ${domain}</span>` : ''}
                     ${pub ? `<span>📅 ${pub}</span>` : ''}
+                    ${noteFile ? `<span>📝 ${noteFile}</span>` : ''}
                   </div>
                   ${summary ? `<p class="source-summary">${summary}</p>` : ''}
                 </div>`;

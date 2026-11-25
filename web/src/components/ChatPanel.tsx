@@ -20,7 +20,15 @@ import {
   WifiOff,
   RefreshCw,
 } from 'lucide-react';
-import type { AgentPresetSummary, AgentToolStep, MessageDTO, ProjectDTO, WorkspaceDTO } from '@atoms/shared';
+import type {
+  AgentBudgetSnapshot,
+  AgentPresetSummary,
+  AgentToolStep,
+  AgentUsageStats,
+  MessageDTO,
+  ProjectDTO,
+  WorkspaceDTO,
+} from '@atoms/shared';
 import { AgentStepCard } from './AgentStepCard';
 
 export interface LiveStreamState {
@@ -33,6 +41,8 @@ export interface LiveStreamState {
   statusText?: string;
   startedAt?: number;
   lastActivityAt?: number;
+  usage?: AgentUsageStats;
+  budget?: AgentBudgetSnapshot;
   seq?: number;
 }
 
@@ -540,6 +550,8 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                         <AgentStepCard
                           thinking={msg.metadata.thinking}
                           steps={msg.metadata.steps}
+                          usage={msg.metadata.usage}
+                          budget={msg.metadata.budget}
                           isRunning={false}
                         />
                       )}
@@ -608,6 +620,8 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                       thinking={liveStream.thinking}
                       steps={liveStream.steps}
                       statusText={liveStream.statusText}
+                      usage={liveStream.usage}
+                      budget={liveStream.budget}
                       isRunning={true}
                       isQueued={liveStream.queued}
                       startedAt={liveStream.startedAt}

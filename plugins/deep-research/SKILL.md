@@ -30,17 +30,18 @@ Before searching broadly:
    - Practical recommendations / decision matrix
 3. Write this plan immediately into `plan.md` in the workspace root so the user can inspect the investigation strategy in real time.
 
-### Phase 2 — Fan-Out Search (Breadth First)
-1. Execute multiple **distinct** `mcp__web_research__web_search` calls — do NOT just reword the same query:
+### Phase 2 — Fan-Out Search (Breadth First, Budget-Bounded)
+1. Execute **3–6 distinct** `mcp__web_research__web_search` calls — do NOT endlessly loop or reword the same query:
    - Use both English and Chinese queries when researching global technology/markets (English queries often uncover primary engineering docs, benchmarks, and GitHub repos).
    - Mix `source` modes where relevant: `"auto"`, `"web"`, `"github"`, `"tech"`, `"academic"`, `"wiki"`.
    - Explicitly run at least one **contrarian / critique query** (e.g., `"<topic> limitations OR drawbacks OR vs"`).
 2. Prefer **primary sources** (official docs, GitHub repositories, papers, release notes, benchmarks) over aggregator listicles.
-3. Aim to inspect **6–15 unique, credible sources** for standard depth (more if the user asks for exhaustive depth).
+3. Aim to deep-fetch **4–8 highest-value primary sources** rather than 30+ noisy pages — quality and timely synthesis beat exhaustive crawling.
 
-### Phase 3 — Deep Crawl & Adversarial Verification (`sources/`)
+### Phase 3 — Deep Crawl & Incremental Persistence (`sources/` + `sources.json`)
 1. Never cite a page solely from a search snippet if it backs a load-bearing claim — call `mcp__web_research__web_fetch` (or `web_crawl` for multi-page docs) to read the actual primary content!
-2. Save concise, structured notes for key fetched sources under `sources/` (e.g., `sources/01-topic-source.md`) when doing deep dives, and maintain a clean `sources.json` index at the workspace root:
+2. **Automatic archiving is built into `web_research` MCP**: every `web_search` automatically logs snippets into `sources/00-search-digest.md` & `sources.json`, and every `web_fetch` / `web_crawl` automatically saves a full structured note file into `sources/NN-*.md` and updates `sources.json` (`status: "fetched"`, `summary`, `noteFile`). You can refine `summary` / `reliability` in `sources.json` as needed, but do NOT spend extra turns re-copying raw pages.
+3. **Budget Discipline**: if the platform sends a budget warning (`75%+` of time/cost/tokens/steps used), **stop searching immediately** and move directly to Phase 4 (`report.md`) using the already-archived `sources.json` and `sources/*.md`.
    ```json
    [
      {
@@ -49,6 +50,8 @@ Before searching broadly:
        "url": "https://...",
        "domain": "example.com",
        "type": "primary | docs | repo | paper | discussion | news",
+       "status": "fetched | snippet",
+       "noteFile": "sources/01-example-com-title.md",
        "publishedAt": "2026-05",
        "reliability": "high | medium | low",
        "summary": "Key verified facts extracted from this source"

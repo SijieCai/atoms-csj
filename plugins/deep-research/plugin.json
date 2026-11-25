@@ -11,8 +11,9 @@
     "description": "Search the live web across multiple sources, fetch & clean webpage content, and crawl documentation or competitor sites with SSRF safety"
   },
   "envNeeds": [
+    "ATOMS_WORKSPACE_DIR",
     "TAVILY_API_KEY",
     "FIRECRAWL_API_KEY"
   ],
-  "systemPromptAppend": "本工作区已加载插件 [deep-research]（含 Skill deep-research 与 MCP 工具 web_research）。所有外网检索与网页爬取必须通过 mcp__web_research__web_search / web_fetch / web_crawl / extract_links 工具完成，严禁凭记忆编造引用链接。最终必须产出结构化带引用编号的 report.md 与 sources.json。"
+  "systemPromptAppend": "本工作区已加载插件 [deep-research]（含 Skill deep-research 与 MCP 工具 web_research）。所有外网检索与网页爬取必须通过 mcp__web_research__web_search / web_fetch / web_crawl / extract_links 工具完成，严禁凭记忆编造引用链接。工具每次成功检索或抓取都会自动把文章摘要与全文笔记落盘到 sources/ 与 sources.json。请严格控制调研节奏（3-6 次聚焦搜索、4-8 篇一手精读），尽快整理出结构化带引用编号的 report.md 与高质量 sources.json 摘要；收到系统预算预警时请立刻停搜并收口输出 report.md。"
 }

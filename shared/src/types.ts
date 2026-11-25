@@ -19,6 +19,35 @@ export interface HandoffMetadata {
   reason?: string;
 }
 
+export interface AgentBudgetConfig {
+  /** Hard time limit in milliseconds */
+  maxDurationMs: number;
+  /** Hard estimated cost limit in CNY */
+  maxCostCny: number;
+  /** Hard cumulative token limit */
+  maxTokens: number;
+  /** Hard tool call count limit */
+  maxToolCalls: number;
+  /** Fraction [0.5..0.95] at which Agent receives a soft steer warning to wrap up */
+  softWarnRatio: number;
+}
+
+export interface AgentUsageStats {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  totalTokens: number;
+  estimatedCostCny: number;
+  toolCalls: number;
+  elapsedMs: number;
+}
+
+export interface AgentBudgetSnapshot {
+  limits: AgentBudgetConfig;
+  softWarned: boolean;
+  exceededReason?: string;
+}
+
 export interface MessageMetadata {
   mode?: 'chat' | 'build' | 'handoff';
   agentId?: string;
@@ -28,6 +57,8 @@ export interface MessageMetadata {
   aborted?: boolean;
   error?: string;
   handoff?: HandoffMetadata;
+  usage?: AgentUsageStats;
+  budget?: AgentBudgetSnapshot;
 }
 
 export interface PluginSummary {
@@ -70,6 +101,7 @@ export interface AgentPresetSummary {
   templateId: string;
   plugins: PluginSummary[];
   intent?: AgentIntentSpec;
+  budget?: Partial<AgentBudgetConfig>;
   ui: AgentUISpec;
 }
 
@@ -102,6 +134,8 @@ export interface ActiveRunSnapshot {
   thinking: string;
   text: string;
   steps: AgentToolStep[];
+  usage?: AgentUsageStats;
+  budget?: AgentBudgetSnapshot;
   seq: number;
 }
 
@@ -179,6 +213,7 @@ export type SSEEventPayload =
   | { type: 'agent_tool_update'; messageId: string; stepId: string; outputDelta: string }
   | { type: 'agent_tool_end'; messageId: string; stepId: string; status: 'done' | 'error'; output?: string }
   | { type: 'agent_status'; messageId: string; statusText: string }
+  | { type: 'agent_budget_update'; messageId: string; usage: AgentUsageStats; budget: AgentBudgetSnapshot }
   | { type: 'preview_ready'; projectId: string; previewUrl: string }
   | { type: 'agent_done'; runId: string; message: MessageDTO; status: 'succeeded' | 'aborted' | 'failed'; error?: string }
   | { type: 'error'; message: string };

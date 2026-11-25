@@ -11,8 +11,12 @@
  *  - extract_links: Fast link discovery for targeted crawling.
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
+
 const TAVILY_API_KEY = (process.env.TAVILY_API_KEY || '').trim();
 const FIRECRAWL_API_KEY = (process.env.FIRECRAWL_API_KEY || '').trim();
+const WORKSPACE_DIR = (process.env.ATOMS_WORKSPACE_DIR || '').trim();
 
 const USER_AGENT =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 AtomsDeepResearch/1.0';
@@ -558,7 +562,8 @@ async function runWebSearch(args) {
     try {
       const results = await searchTavily(query, maxResults);
       if (results.length > 0) {
-        return { query, provider: 'tavily', count: results.length, results };
+        const archived = archiveSearchResults(query, 'tavily', results);
+        return { query, provider: 'tavily', count: results.length, results, ...(archived ? { archived } : {}) };
       }
     } catch {
       // fall through to built-in federated search
@@ -569,7 +574,8 @@ async function runWebSearch(args) {
     try {
       const results = await searchFirecrawl(query, maxResults);
       if (results.length > 0) {
-        return { query, provider: 'firecrawl', count: results.length, results };
+        const archived = archiveSearchResults(query, 'firecrawl', results);
+        return { query, provider: 'firecrawl', count: results.length, results, ...(archived ? { archived } : {}) };
       }
     } catch {
       // fall through
@@ -607,12 +613,297 @@ async function runWebSearch(args) {
     .map((s) => s.value);
 
   const results = deduplicateResults(lists, maxResults);
+  const archived = archiveSearchResults(query, `federated(${source})`, results);
   return {
     query,
     provider: `federated(${source})`,
     count: results.length,
     results,
+    ...(archived ? { archived } : {}),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Automatic Workspace Archiving (Never lose search/fetch summaries on abort!)
+// ---------------------------------------------------------------------------
+
+function normalizeUrlKey(rawUrl) {
+  try {
+    const u = new URL(String(rawUrl || '').trim());
+    u.hash = '';
+    return u.toString().replace(/\/+$/, '').toLowerCase();
+  } catch {
+    return String(rawUrl || '').trim().replace(/\/+$/, '').toLowerCase();
+  }
+}
+
+function getDomainSafe(rawUrl) {
+  try {
+    return new URL(String(rawUrl || '')).hostname.replace(/^www\./, '');
+  } catch {
+    return '';
+  }
+}
+
+function slugifySegment(str, maxLen = 36) {
+  const cleaned = String(str || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fff]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, maxLen)
+    .replace(/-+$/g, '');
+  return cleaned || 'page';
+}
+
+function inferSourceType(rawUrl, channel) {
+  const lower = String(rawUrl || '').toLowerCase();
+  if (channel === 'github' || lower.includes('github.com/')) return 'repo';
+  if (channel === 'arxiv' || lower.includes('arxiv.org/')) return 'paper';
+  if (channel === 'hackernews' || lower.includes('news.ycombinator.com') || lower.includes('reddit.com')) {
+    return 'discussion';
+  }
+  if (String(channel || '').startsWith('wikipedia') || lower.includes('wikipedia.org/')) return 'wiki';
+  if (/\/docs?\b|docs\.|developer\.|documentation/i.test(lower)) return 'docs';
+  return 'web';
+}
+
+function extractSmartSummary(content, metaDescription = '', maxChars = 420) {
+  const parts = [];
+  const cleanMeta = String(metaDescription || '').replace(/\s+/g, ' ').trim();
+  if (cleanMeta.length >= 25) {
+    parts.push(cleanMeta);
+  }
+  const paragraphs = String(content || '')
+    .split(/\n{2,}/)
+    .map((p) => p.replace(/^#+\s*/gm, '').replace(/```[\s\S]*?```/g, '').replace(/\s+/g, ' ').trim())
+    .filter((p) => p.length >= 35 && !/^\|/.test(p) && !/^[-*]\s*(http|\/)/.test(p));
+
+  for (const p of paragraphs) {
+    if (parts.join(' ').length >= maxChars) break;
+    if (cleanMeta && p.slice(0, 60) === cleanMeta.slice(0, 60)) continue;
+    parts.push(p);
+    if (parts.length >= 3) break;
+  }
+
+  const combined = parts.join(' ').replace(/\s+/g, ' ').trim();
+  if (!combined) {
+    return String(content || '').replace(/\s+/g, ' ').trim().slice(0, maxChars);
+  }
+  return combined.length > maxChars ? `${combined.slice(0, maxChars - 1)}…` : combined;
+}
+
+function readSourcesJsonSafe(wsDir) {
+  const file = path.join(wsDir, 'sources.json');
+  if (!fs.existsSync(file)) return [];
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeJsonAtomic(filePath, data) {
+  const tmpPath = `${filePath}.tmp-${process.pid}`;
+  fs.writeFileSync(tmpPath, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+  fs.renameSync(tmpPath, filePath);
+}
+
+function archiveSearchResults(query, provider, results) {
+  if (!WORKSPACE_DIR || !fs.existsSync(WORKSPACE_DIR) || !Array.isArray(results) || results.length === 0) {
+    return null;
+  }
+  try {
+    const sourcesDir = path.join(WORKSPACE_DIR, 'sources');
+    fs.mkdirSync(sourcesDir, { recursive: true });
+
+    // 1. Append structured query log
+    const logPath = path.join(sourcesDir, '_search-log.json');
+    let logEntries = [];
+    if (fs.existsSync(logPath)) {
+      try {
+        const prev = JSON.parse(fs.readFileSync(logPath, 'utf8'));
+        if (Array.isArray(prev)) logEntries = prev;
+      } catch {
+        logEntries = [];
+      }
+    }
+    const nowIso = new Date().toISOString();
+    logEntries.push({
+      timestamp: nowIso,
+      query,
+      provider,
+      count: results.length,
+      results: results.map((r) => ({
+        title: r.title,
+        url: r.url,
+        snippet: r.snippet || '',
+        source: r.source || provider,
+        publishedAt: r.publishedAt || undefined,
+      })),
+    });
+    if (logEntries.length > 100) logEntries = logEntries.slice(-100);
+    writeJsonAtomic(logPath, logEntries);
+
+    // 2. Append human-readable search digest markdown
+    const digestPath = path.join(sourcesDir, '00-search-digest.md');
+    const isNewDigest = !fs.existsSync(digestPath);
+    const mdLines = [];
+    if (isNewDigest) {
+      mdLines.push('# 检索文章摘要自动归档日志', '', '> 每次外网搜索结果均由 `web_research` MCP 自动落盘，防止调研中断后丢失。', '');
+    }
+    mdLines.push(`## [${nowIso.slice(11, 19)}] 检索：${query}（${provider}，${results.length} 条）`, '');
+    for (const r of results) {
+      const snip = String(r.snippet || '').replace(/\s+/g, ' ').trim();
+      mdLines.push(`- **[${r.title || r.url}](${r.url})**${r.publishedAt ? ` (${r.publishedAt})` : ''}`);
+      if (snip) mdLines.push(`  - 摘要：${snip}`);
+    }
+    mdLines.push('');
+    fs.appendFileSync(digestPath, `${mdLines.join('\n')}\n`, 'utf8');
+
+    // 3. Merge into sources.json without downgrading already-fetched entries
+    const list = readSourcesJsonSafe(WORKSPACE_DIR);
+    const byKey = new Map();
+    let maxId = 0;
+    for (const item of list) {
+      const idNum = Number(item?.id || 0);
+      if (idNum > maxId) maxId = idNum;
+      if (item?.url) byKey.set(normalizeUrlKey(item.url), item);
+    }
+
+    let added = 0;
+    for (const r of results) {
+      if (!r?.url) continue;
+      const key = normalizeUrlKey(r.url);
+      const existing = byKey.get(key);
+      if (existing) {
+        if (!existing.summary && r.snippet) {
+          existing.summary = String(r.snippet).slice(0, 420);
+        }
+        if (!existing.publishedAt && r.publishedAt) {
+          existing.publishedAt = r.publishedAt;
+        }
+        continue;
+      }
+      const nextId = ++maxId;
+      const entry = {
+        id: nextId,
+        title: r.title || r.url,
+        url: r.url,
+        domain: getDomainSafe(r.url),
+        type: inferSourceType(r.url, r.source),
+        status: 'snippet',
+        reliability: 'medium',
+        publishedAt: r.publishedAt || undefined,
+        summary: String(r.snippet || '').replace(/\s+/g, ' ').trim().slice(0, 420),
+        discoveredByQuery: query,
+      };
+      list.push(entry);
+      byKey.set(key, entry);
+      added += 1;
+    }
+
+    writeJsonAtomic(path.join(WORKSPACE_DIR, 'sources.json'), list);
+    return {
+      addedToSourcesJson: added,
+      totalSources: list.length,
+      digestFile: 'sources/00-search-digest.md',
+    };
+  } catch {
+    return null;
+  }
+}
+
+function archiveFetchedPage(page) {
+  if (!WORKSPACE_DIR || !fs.existsSync(WORKSPACE_DIR) || !page?.url) {
+    return null;
+  }
+  try {
+    const sourcesDir = path.join(WORKSPACE_DIR, 'sources');
+    fs.mkdirSync(sourcesDir, { recursive: true });
+
+    const list = readSourcesJsonSafe(WORKSPACE_DIR);
+    const key = normalizeUrlKey(page.url);
+    let maxId = 0;
+    let existing = null;
+    for (const item of list) {
+      const idNum = Number(item?.id || 0);
+      if (idNum > maxId) maxId = idNum;
+      if (item?.url && normalizeUrlKey(item.url) === key) {
+        existing = item;
+      }
+    }
+
+    const sourceId = existing?.id ? Number(existing.id) : maxId + 1;
+    const domain = getDomainSafe(page.url);
+    const type = inferSourceType(page.url, page.provider);
+    const summary = extractSmartSummary(page.content, page.description, 460);
+    const noteRelPath =
+      existing?.noteFile ||
+      `sources/${String(sourceId).padStart(2, '0')}-${slugifySegment(domain, 20)}-${slugifySegment(page.title, 28)}.md`;
+
+    const nowIso = new Date().toISOString();
+    const noteContent = [
+      `# ${page.title || page.url}`,
+      '',
+      `- **信源编号**：\`[${sourceId}]\``,
+      `- **原文链接**：${page.url}`,
+      `- **域名**：${domain || 'unknown'}`,
+      `- **类型**：${type}`,
+      `- **抓取方式**：${page.provider || 'direct-fetch'}`,
+      `- **抓取时间**：${nowIso}`,
+      `- **原文长度**：${page.charCount || String(page.content || '').length} 字符`,
+      '',
+      '## 自动提取摘要',
+      '',
+      summary || '（未能提取正文摘要，请查看下方正文摘录）',
+      '',
+      '## 正文摘录',
+      '',
+      String(page.content || '').slice(0, 16000),
+      '',
+    ].join('\n');
+
+    fs.writeFileSync(path.join(WORKSPACE_DIR, noteRelPath), noteContent, 'utf8');
+
+    const reliability = ['docs', 'repo', 'paper', 'wiki'].includes(type) ? 'high' : 'medium';
+    if (existing) {
+      existing.title = page.title || existing.title || page.url;
+      existing.url = page.url;
+      existing.domain = domain || existing.domain;
+      existing.type = existing.type || type;
+      existing.status = 'fetched';
+      existing.noteFile = noteRelPath;
+      existing.reliability = existing.reliability === 'high' ? 'high' : reliability;
+      existing.charCount = page.charCount || String(page.content || '').length;
+      existing.fetchedAt = nowIso;
+      if (summary) existing.summary = summary;
+    } else {
+      list.push({
+        id: sourceId,
+        title: page.title || page.url,
+        url: page.url,
+        domain,
+        type,
+        status: 'fetched',
+        noteFile: noteRelPath,
+        reliability,
+        charCount: page.charCount || String(page.content || '').length,
+        fetchedAt: nowIso,
+        summary,
+      });
+    }
+
+    writeJsonAtomic(path.join(WORKSPACE_DIR, 'sources.json'), list);
+    return {
+      sourceId,
+      noteFile: noteRelPath,
+      totalSources: list.length,
+      sourcesJsonUpdated: true,
+    };
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -620,6 +911,12 @@ async function runWebSearch(args) {
 // ---------------------------------------------------------------------------
 
 async function fetchPageClean(rawUrl, maxChars = 12000) {
+  const result = await fetchPageCleanRaw(rawUrl, maxChars);
+  const archived = archiveFetchedPage(result);
+  return archived ? { ...result, archived } : result;
+}
+
+async function fetchPageCleanRaw(rawUrl, maxChars = 12000) {
   const clampedMax = Math.max(500, Math.min(24000, Number(maxChars || 12000)));
   const parsed = validatePublicUrl(rawUrl);
 
@@ -727,6 +1024,7 @@ async function runWebCrawl(args) {
       title: seedPage.title,
       description: seedPage.description,
       content: seedPage.content,
+      ...(seedPage.archived ? { archived: seedPage.archived } : {}),
     },
   ];
 
@@ -762,6 +1060,7 @@ async function runWebCrawl(args) {
         title: page.title,
         description: page.description,
         content: page.content,
+        ...(page.archived ? { archived: page.archived } : {}),
       };
     }),
   );
