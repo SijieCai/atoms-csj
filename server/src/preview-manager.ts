@@ -26,6 +26,24 @@ export interface PreviewAppContext {
   presetId?: string;
 }
 
+function readPackageMeta(workspaceDir: string): { hasDeps: boolean; hasBuildScript: boolean } {
+  try {
+    const pkgPath = path.join(workspaceDir, 'package.json');
+    if (!fs.existsSync(pkgPath)) return { hasDeps: false, hasBuildScript: false };
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8')) as {
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+      scripts?: Record<string, string>;
+    };
+    const depCount =
+      Object.keys(pkg.dependencies || {}).length + Object.keys(pkg.devDependencies || {}).length;
+    const hasBuildScript = Boolean(pkg.scripts && typeof pkg.scripts.build === 'string' && pkg.scripts.build.trim());
+    return { hasDeps: depCount > 0, hasBuildScript };
+  } catch {
+    return { hasDeps: true, hasBuildScript: true };
+  }
+}
+
 function assertValidProjectId(projectId: string): void {
   if (!PROJECT_ID_RE.test(projectId)) {
     throw new Error('Invalid projectId');
@@ -162,7 +180,8 @@ class PreviewManager {
       },
     });
 
-    if (!fs.existsSync(path.join(workspaceDir, 'node_modules'))) {
+    const { hasDeps } = readPackageMeta(workspaceDir);
+    if (hasDeps && !fs.existsSync(path.join(workspaceDir, 'node_modules'))) {
       const res = await runCommand('npm', ['install', '--no-audit', '--no-fund'], workspaceDir, 180_000);
       if (res.code !== 0) {
         throw new Error(`工作区依赖安装失败:\n${res.output.slice(-800)}`);
@@ -269,7 +288,8 @@ class PreviewManager {
       }
     };
 
-    if (!fs.existsSync(path.join(workspaceDir, 'node_modules'))) {
+    const { hasDeps, hasBuildScript } = readPackageMeta(workspaceDir);
+    if (hasDeps && !fs.existsSync(path.join(workspaceDir, 'node_modules'))) {
       pushLog('[platform] installing dependencies...');
       const inst = await runCommand('npm', ['install', '--no-audit', '--no-fund'], workspaceDir, 180_000);
       pushLog(inst.output);
@@ -280,7 +300,7 @@ class PreviewManager {
     }
 
     const distIndex = path.join(workspaceDir, 'dist', 'index.html');
-    if (forceBuild || !fs.existsSync(distIndex)) {
+    if (hasBuildScript && (forceBuild || !fs.existsSync(distIndex))) {
       pushLog('[platform] running npm run build...');
       const buildRes = await runCommand('npm', ['run', 'build'], workspaceDir, 120_000);
       pushLog(buildRes.output);

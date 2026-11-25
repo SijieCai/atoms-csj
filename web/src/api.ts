@@ -3,6 +3,7 @@ import type {
   AgentPresetSummary,
   FileTreeNode,
   MessageDTO,
+  PluginSummary,
   ProjectDTO,
   TableInfoDTO,
   WorkspaceDTO,
@@ -29,11 +30,30 @@ export interface AuthMeResponse {
   user: { username: string };
   glmConfigured: boolean;
   model: string;
+  presets?: AgentPresetSummary[];
+  agents?: AgentPresetSummary[];
+}
+
+export interface SendMessageResponse {
+  mode: 'chat' | 'build' | 'steered' | 'queued' | 'handoff';
+  targetAgentId?: string | null;
+  userMessage: MessageDTO;
+  handoffMessage?: MessageDTO;
+  spawnedProject?: ProjectDTO;
+  spawnedWorkspace?: WorkspaceDTO;
+  project?: ProjectDTO;
+  workspace?: WorkspaceDTO;
+  messageId?: string;
+  runId?: string;
 }
 
 export const api = {
   me(): Promise<AuthMeResponse> {
     return request<AuthMeResponse>('/api/auth/me');
+  },
+
+  listAgents(): Promise<{ agents: AgentPresetSummary[]; plugins: PluginSummary[] }> {
+    return request('/api/agents');
   },
 
   login(username: string, password: string): Promise<{ user: { username: string } }> {
@@ -47,15 +67,15 @@ export const api = {
     return request('/api/auth/logout', { method: 'POST' });
   },
 
-  // ---- Workspaces (Code Repos) ----
+  // ---- Workspaces (Code Repos & Research Spaces) ----
   listWorkspaces(): Promise<{ workspaces: WorkspaceDTO[] }> {
     return request('/api/workspaces');
   },
 
-  createWorkspace(name: string): Promise<{ workspace: WorkspaceDTO }> {
+  createWorkspace(name: string, presetId?: string): Promise<{ workspace: WorkspaceDTO }> {
     return request('/api/workspaces', {
       method: 'POST',
-      body: JSON.stringify({ name }),
+      body: JSON.stringify({ name, presetId }),
     });
   },
 
@@ -77,10 +97,14 @@ export const api = {
     return request('/api/projects');
   },
 
-  createProject(title?: string, workspaceId?: string | null): Promise<{ project: ProjectDTO }> {
+  createProject(
+    title?: string,
+    workspaceId?: string | null,
+    presetId?: string,
+  ): Promise<{ project: ProjectDTO }> {
     return request('/api/projects', {
       method: 'POST',
-      body: JSON.stringify({ title, workspaceId: workspaceId ?? null }),
+      body: JSON.stringify({ title, workspaceId: workspaceId ?? null, presetId }),
     });
   },
 
@@ -99,7 +123,7 @@ export const api = {
 
   bindWorkspace(
     projectId: string,
-    payload: { workspaceId?: string; createNew?: boolean; name?: string },
+    payload: { workspaceId?: string; createNew?: boolean; name?: string; presetId?: string },
   ): Promise<{ ok: boolean; project: ProjectDTO; workspace: WorkspaceDTO }> {
     return request(`/api/projects/${encodeURIComponent(projectId)}/bind-workspace`, {
       method: 'POST',
@@ -110,16 +134,15 @@ export const api = {
   sendMessage(
     projectId: string,
     content: string,
-    forceBuild = false,
-  ): Promise<{
-    mode: 'chat' | 'build' | 'steered' | 'queued';
-    userMessage: MessageDTO;
-    messageId?: string;
-    runId?: string;
-  }> {
+    opts?: { forceBuild?: boolean; targetAgentId?: string },
+  ): Promise<SendMessageResponse> {
     return request(`/api/projects/${encodeURIComponent(projectId)}/messages`, {
       method: 'POST',
-      body: JSON.stringify({ content, forceBuild }),
+      body: JSON.stringify({
+        content,
+        forceBuild: Boolean(opts?.forceBuild),
+        targetAgentId: opts?.targetAgentId,
+      }),
     });
   },
 

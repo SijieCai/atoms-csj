@@ -1,0 +1,18 @@
+{
+  "id": "deep-research",
+  "name": "Deep Research 深度研究与外网爬虫",
+  "version": "1.0.0",
+  "description": "集成 GitHub 热门 deep-research 研究方法论 Skill 与外网检索/网页爬虫 Stdio MCP Server（web_search / web_fetch / web_crawl / extract_links）。",
+  "skillDir": ".",
+  "mcp": {
+    "serverName": "web_research",
+    "entry": "mcp-server.mjs",
+    "exposure": "direct",
+    "description": "Search the live web across multiple sources, fetch & clean webpage content, and crawl documentation or competitor sites with SSRF safety"
+  },
+  "envNeeds": [
+    "TAVILY_API_KEY",
+    "FIRECRAWL_API_KEY"
+  ],
+  "systemPromptAppend": "本工作区已加载插件 [deep-research]（含 Skill deep-research 与 MCP 工具 web_research）。所有外网检索与网页爬取必须通过 mcp__web_research__web_search / web_fetch / web_crawl / extract_links 工具完成，严禁凭记忆编造引用链接。最终必须产出结构化带引用编号的 report.md 与 sources.json。"
+}

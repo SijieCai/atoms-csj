@@ -1,0 +1,49 @@
+{
+  "id": "deep-research",
+  "aliases": [],
+  "name": "Deep Research Agent",
+  "shortName": "深度研究",
+  "icon": "research",
+  "description": "组合 GitHub 热门 deep-research Skill、外网搜索/爬虫 MCP 插件与交互式报告模板，自动执行多源检索、网页抓取、交叉核验并生成带完整引用的深度研究报告。",
+  "templateId": "deep-research",
+  "plugins": ["deep-research"],
+  "systemPromptFile": "SYSTEM.md",
+  "intent": {
+    "description": "用户希望针对某个主题、技术、行业、产品或竞品开展深入网络调研、多源信息搜集、事实核查、对比分析或输出带来源引用的研究报告。",
+    "keywords": [
+      "深度研究",
+      "深度调研",
+      "调研报告",
+      "研究报告",
+      "竞品分析",
+      "行业调研",
+      "技术选型",
+      "文献综述",
+      "事实核查",
+      "deep research",
+      "research report",
+      "investigate",
+      "compare",
+      "literature review"
+    ],
+    "examples": [
+      "请帮我深度调研 2026 年主流 AI Coding Agent 的架构与工具调用差异，输出带引用来源的报告",
+      "深度分析 Model Context Protocol (MCP) 的生态现状、优势与安全风险"
+    ]
+  },
+  "ui": {
+    "workspaceLabel": "研究空间",
+    "previewTabLabel": "研究报告",
+    "tabs": ["preview", "code", "logs"],
+    "starterPrompts": [
+      {
+        "title": "🔬 Deep Research：MCP 协议生态深度调研",
+        "prompt": "请使用 Deep Research 帮我深度调研 Model Context Protocol (MCP) 的架构设计、主流开源 SDK 生态与安全局限，输出带完整信源引用的研究报告。"
+      },
+      {
+        "title": "🔬 Deep Research：AI Coding Agent 竞品对比",
+        "prompt": "帮我深度研究当前主流开源 AI Coding Agent 的沙箱隔离与工具调用架构差异，给出对比表格、争议点与选型建议。"
+      }
+    ]
+  }
+}

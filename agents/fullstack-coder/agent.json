@@ -1,0 +1,48 @@
+{
+  "id": "fullstack-coder",
+  "aliases": ["fullstack-web"],
+  "name": "Fullstack Coder Agent",
+  "shortName": "全栈开发",
+  "icon": "code",
+  "description": "预置 React 19 + Express 5 全栈模板，挂载用户隔离 SQLite 存储代理插件（Skill + MCP + 运行时 SDK），自动编码、构建并启动可预览全栈应用。",
+  "templateId": "fullstack-app",
+  "plugins": ["sqlite-storage"],
+  "systemPromptFile": "SYSTEM.md",
+  "intent": {
+    "description": "用户希望创建、开发、编写、修改或修复一个可交互的网站、全栈应用、页面、后台工具、数据看板或数据库功能；或确认先前讨论的建站方案。",
+    "keywords": [
+      "做个网站",
+      "写一个",
+      "开发",
+      "构建应用",
+      "建站",
+      "页面",
+      "全栈",
+      "数据库",
+      "看板",
+      "记账本",
+      "计算器",
+      "build app",
+      "create website"
+    ],
+    "examples": [
+      "帮我构建一个个人记账本网站，支持收支记录与统计图表",
+      "给当前应用增加一个暗黑模式开关和导出 CSV 按钮"
+    ]
+  },
+  "ui": {
+    "workspaceLabel": "代码仓库",
+    "previewTabLabel": "应用预览",
+    "tabs": ["preview", "code", "database", "logs"],
+    "starterPrompts": [
+      {
+        "title": "个人记账本（SQLite 持久化）",
+        "prompt": "帮我构建一个个人记账本网站，支持新增收入/支出记录、分类筛选、月度汇总统计图表，所有数据真实持久化到 SQLite 数据库。"
+      },
+      {
+        "title": "轻量任务看板（增删改查）",
+        "prompt": "帮我做一个团队任务看板应用，包含待办/进行中/已完成三列，支持新建任务、切换状态、设置优先级与关键词搜索，数据存到 SQLite。"
+      }
+    ]
+  }
+}

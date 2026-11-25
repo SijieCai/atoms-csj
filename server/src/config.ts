@@ -54,6 +54,7 @@ export const config = {
   workspacesDir: path.join(dataDir, 'workspaces'),
   piConfigDir: path.join(dataDir, 'pi-config'),
   pluginsDir: path.join(REPO_ROOT, 'plugins'),
+  agentsDir: path.join(REPO_ROOT, 'agents'),
   templatesDir: path.join(REPO_ROOT, 'templates'),
   templateDir: path.join(REPO_ROOT, 'templates', 'fullstack-app'),
   webDistDir: path.join(REPO_ROOT, 'web', 'dist'),
@@ -66,6 +67,9 @@ export const config = {
   glmBaseUrl,
   glmModel,
   glmChatModel,
+
+  tavilyApiKey: (process.env.TAVILY_API_KEY || '').trim(),
+  firecrawlApiKey: (process.env.FIRECRAWL_API_KEY || '').trim(),
 
   agentTimeoutMs: Number(process.env.AGENT_TIMEOUT_MS || 480_000),
   maxConcurrentAgents: Number(process.env.MAX_CONCURRENT_AGENTS || 2),

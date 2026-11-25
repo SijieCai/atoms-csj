@@ -112,12 +112,14 @@ export interface StartBuildParams {
   userMessage: string;
   history: MessageDTO[];
   isInitialBuild: boolean;
+  handoffContext?: string;
   onSettled: (workspaceId: string, ok: boolean) => Promise<string | null>;
 }
 
 interface ActiveRun {
   projectId: string;
   workspaceId: string;
+  presetId: string;
   owner: string;
   runId: string;
   messageId: string;
@@ -429,17 +431,22 @@ class PiAgentManager {
     fs.mkdirSync(sessionDir, { recursive: true });
 
     const wsRow = dbStore.getWorkspace(params.workspaceId);
+    const canonicalAgentId = bundle.preset.manifest.id;
+    const isResearch = canonicalAgentId === 'deep-research';
     const contextMd = [
       '# Project Conversation Context',
       '',
       `- Workspace: ${wsRow?.name || params.workspaceId} (${params.workspaceId})`,
       `- Conversation Thread: ${params.projectId}`,
-      `- Preset: ${bundle.preset.manifest.id} (${bundle.preset.manifest.name})`,
+      `- Agent Recipe: ${bundle.preset.manifest.id} (${bundle.preset.manifest.name})`,
       `- Loaded Plugins: ${bundle.preset.plugins.map((p) => p.manifest.id).join(', ') || 'none'}`,
       bundle.runtimeEnv.ATOMS_DB_PREFIX
         ? `- Isolated DB Table Prefix: \`${bundle.runtimeEnv.ATOMS_DB_PREFIX}\` (always use logical table names; proxy prefixes automatically)`
         : '',
       '',
+      ...(params.handoffContext
+        ? ['## CROSS-AGENT HANDOFF CONTEXT', params.handoffContext.trim(), '']
+        : []),
       ...params.history.slice(-20).map((m) => `## ${m.role.toUpperCase()}\n${m.content}\n`),
       `## LATEST REQUEST\n${params.userMessage}\n`,
     ].join('\n');
@@ -453,15 +460,18 @@ class PiAgentManager {
         params.projectId,
         'assistant',
         '',
-        { mode: 'build', steps: [], thinking: '' },
+        { mode: 'build', agentId: canonicalAgentId, steps: [], thinking: '' },
         messageId,
       );
     }
 
-    const initialStatus = '正在隔离工作区启动 Pi Coding Agent...';
+    const initialStatus = isResearch
+      ? '正在隔离研究空间启动 Deep Research Agent 与外网检索 MCP...'
+      : '正在隔离工作区启动 Fullstack Coder Agent...';
     const updatedProj = dbStore.updateProject(params.projectId, {
       status: 'building',
       workspaceId: params.workspaceId,
+      presetId: canonicalAgentId,
     });
     if (updatedProj) {
       const dto = {
@@ -521,6 +531,7 @@ class PiAgentManager {
     const run: ActiveRun = {
       projectId: params.projectId,
       workspaceId: params.workspaceId,
+      presetId: canonicalAgentId,
       owner: params.owner,
       runId,
       messageId,
@@ -565,9 +576,13 @@ class PiAgentManager {
     this.emitWorkspaceUpdate(params.owner, params.workspaceId, false);
     this.attachSubprocessHandlers(run);
 
-    const agentPrompt = params.isInitialBuild
-      ? `请先阅读工作区里的 AGENTS.md、PROJECT_CONTEXT.md 以及已加载的 atoms-sqlite-storage Skill 指南，然后根据用户需求完成这个全栈网站的开发（前端 React+Tailwind 写在 client/，后端 Express 接口写在 server/index.js 并使用 ./db.js 代理客户端读写数据；同时优先调用 atoms_db MCP 工具完成建表和写入示例数据）。\n\n用户最新需求：\n${params.userMessage}\n\n完成后请务必执行 npm run build 确保前端编译通过，并检查 server/index.js 无语法错误，最后用简洁中文汇报你实现的功能、创建的数据表和交互亮点。不要在后台遗留运行中的服务器进程。`
-      : `请根据用户的最新修改需求，在当前工作区（遵守 AGENTS.md 与 atoms-sqlite-storage Skill 规范，保持相对路径 ./api/... 并使用 atoms_db MCP / ./db.js 代理操作数据）进行增量修改，完成后执行 npm run build 验证无报错并汇报改动内容。\n\n用户需求：\n${params.userMessage}`;
+    const agentPrompt = isResearch
+      ? params.isInitialBuild
+        ? `请先阅读工作区里的 AGENTS.md、PROJECT_CONTEXT.md 以及已加载的 deep-research Skill，然后按四阶段研究流水线完成深度调研：\n1. 先写 plan.md 明确研究维度与子问题；\n2. 调用 mcp__web_research__web_search 进行多角度外网检索（含一手来源与反方观点）；\n3. 调用 mcp__web_research__web_fetch / web_crawl 精读关键网页全文，整理并写入合法 JSON 数组 sources.json；\n4. 撰写带内联引用 [1][2]、对比表格、置信度与争议分析的完整报告到 report.md。\n\n用户研究需求：\n${params.userMessage}\n\n完成后请检查 sources.json 为合法 JSON、report.md 内容完整，最后在对话中输出一份精炼的核心结论摘要，并提醒用户可在右侧「研究报告」面板查看完整交互式报告。`
+        : `请结合工作区已有的 plan.md、sources.json 与 report.md，根据用户的最新追问或补充需求，继续调用 mcp__web_research__web_search / web_fetch 检索新信源，更新 sources.json 和 report.md（保持引用编号一一对应且绝不编造链接），最后用简洁中文汇报新增发现。\n\n用户最新需求：\n${params.userMessage}`
+      : params.isInitialBuild
+        ? `请先阅读工作区里的 AGENTS.md、PROJECT_CONTEXT.md 以及已加载的 atoms-sqlite-storage Skill 指南，然后根据用户需求完成这个全栈网站的开发（前端 React+Tailwind 写在 client/，后端 Express 接口写在 server/index.js 并使用 ./db.js 代理客户端读写数据；同时优先调用 atoms_db MCP 工具完成建表和写入示例数据）。\n\n用户最新需求：\n${params.userMessage}\n\n完成后请务必执行 npm run build 确保前端编译通过，并检查 server/index.js 无语法错误，最后用简洁中文汇报你实现的功能、创建的数据表和交互亮点。不要在后台遗留运行中的服务器进程。`
+        : `请根据用户的最新修改需求，在当前工作区（遵守 AGENTS.md 与 atoms-sqlite-storage Skill 规范，保持相对路径 ./api/... 并使用 atoms_db MCP / ./db.js 代理操作数据）进行增量修改，完成后执行 npm run build 验证无报错并汇报改动内容。\n\n用户需求：\n${params.userMessage}`;
 
     this.writeRpc(child, {
       id: `prompt-${++run.reqSeq}`,
@@ -986,9 +1001,12 @@ class PiAgentManager {
     }
 
     let previewUrl: string | null = null;
+    const isResearch = run.presetId === 'deep-research';
     const workspaceStillExists = Boolean(dbStore.getWorkspace(run.workspaceId));
     if (status === 'succeeded' && workspaceStillExists) {
-      const statusText = '代码已完成，正在启动全栈应用与 SQLite 数据库预览服务...';
+      const statusText = isResearch
+        ? '研究报告已完成，正在启动交互式报告预览服务...'
+        : '代码已完成，正在启动全栈应用与 SQLite 数据库预览服务...';
       run.statusText = statusText;
       run.lastActivityAt = Date.now();
       run.lastSeq = eventBus.emit(run.projectId, {
@@ -1009,13 +1027,16 @@ class PiAgentManager {
     const finalContent =
       run.assistantText.trim() ||
       (status === 'aborted'
-        ? '已停止本次构建任务。你可以继续输入新的需求或修改意见。'
+        ? '已停止本次任务。你可以继续输入新的需求或修改意见。'
         : status === 'failed'
-          ? `构建过程中遇到错误：${error || '未知错误'}`
-          : '全栈项目构建完成！你可以在右侧预览并与应用交互。');
+          ? `执行过程中遇到错误：${error || '未知错误'}`
+          : isResearch
+            ? '深度研究报告已生成！你可以在右侧「研究报告」面板查看完整内容与参考信源。'
+            : '全栈项目构建完成！你可以在右侧预览并与应用交互。');
 
     const metadata: MessageMetadata = {
       mode: 'build',
+      agentId: run.presetId,
       thinking: run.thinkingText || undefined,
       steps: run.steps,
       previewUrl: previewUrl || undefined,

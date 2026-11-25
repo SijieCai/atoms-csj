@@ -1,0 +1,18 @@
+# Atoms 文档索引（Docs Index）
+
+本目录沉淀仓库所有需求的**讨论过程、架构设计决策与问题排查复盘**。新增需求或修复请遵循 [`CONTRIBUTING.md`](../CONTRIBUTING.md) 中的「一需求一分支 + 先文档后编码」规范。
+
+---
+
+## 架构设计与需求方案 (`docs/architecture/`)
+
+| 日期 | 文档 | 核心主题 |
+|---|---|---|
+| 2026-11-25 | [`2026-11-25-workspace-thread-decoupling.md`](./architecture/2026-11-25-workspace-thread-decoupling.md) | P0 IDE/工作区视图彻底隔离 + P1 `Workspace (1) : Thread (N)` 领域解耦与同仓库串行写队列 |
+| 2026-11-25 | [`2026-11-25-deep-research-agent-and-recipes.md`](./architecture/2026-11-25-deep-research-agent-and-recipes.md) | Deep Research Agent 扩展（GitHub Skill + 外网爬虫 MCP + 报告模板）、`agents/` 声明式配方目录、多 Agent 意图路由与跨 Agent 自动新建 Thread |
+
+## 问题排查与修复复盘 (`docs/issues/`)
+
+| 日期 | 文档 | 核心主题 |
+|---|---|---|
+| 2026-11-25 | [`2026-11-25-project-switch-agent-state-loss.md`](./issues/2026-11-25-project-switch-agent-state-loss.md) | 多项目切换导致子 Agent 运行状态丢失与侧边栏同步修复（ActiveRun 快照 + SSE seq 去重 + 全局用户 SSE） |

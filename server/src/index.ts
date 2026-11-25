@@ -128,12 +128,21 @@ app.get('/api/auth/me', (req, res) => {
     glmConfigured: Boolean(config.glmApiKey),
     model: config.glmModel,
     presets: pluginRegistry.listPresets(),
+    agents: pluginRegistry.listPresets(),
   });
 });
 
 app.get('/api/presets', requireAuth, (_req, res) => {
   res.json({
     presets: pluginRegistry.listPresets(),
+    agents: pluginRegistry.listPresets(),
+    plugins: pluginRegistry.listPlugins(),
+  });
+});
+
+app.get('/api/agents', requireAuth, (_req, res) => {
+  res.json({
+    agents: pluginRegistry.listPresets(),
     plugins: pluginRegistry.listPlugins(),
   });
 });
@@ -143,11 +152,15 @@ app.get('/api/presets', requireAuth, (_req, res) => {
 // ---------------------------------------------------------------------------
 function enrichWorkspace(row: WorkspaceRow | undefined): WorkspaceDTO | null {
   if (!row) return null;
-  return toWorkspaceDTO(
-    row,
-    previewManager.isRunning(row.id),
-    piManager.getWorkspaceBuildState(row.id),
-  );
+  const canonical = pluginRegistry.canonicalAgentId(row.preset_id);
+  return {
+    ...toWorkspaceDTO(
+      row,
+      previewManager.isRunning(row.id),
+      piManager.getWorkspaceBuildState(row.id),
+    ),
+    presetId: canonical,
+  };
 }
 
 function enrichProject(row: ReturnType<typeof dbStore.getProject>): ProjectDTO | null {
@@ -155,6 +168,7 @@ function enrichProject(row: ReturnType<typeof dbStore.getProject>): ProjectDTO |
   const ws = row.workspace_id ? dbStore.getWorkspace(row.workspace_id) : undefined;
   const summary = piManager.getActiveSummary(row.id);
   const chatSnap = activeChatRuns.get(row.id);
+  const canonicalPreset = pluginRegistry.canonicalAgentId(ws?.preset_id || row.preset_id);
   const base = toProjectDTO(
     row,
     ws ? previewManager.isRunning(ws.id) : false,
@@ -162,6 +176,7 @@ function enrichProject(row: ReturnType<typeof dbStore.getProject>): ProjectDTO |
   );
   return {
     ...base,
+    presetId: canonicalPreset,
     status: summary.isBuilding ? (summary.queued ? 'queued' : 'building') : base.status,
     activeStep: summary.isBuilding
       ? summary.activeStep
@@ -208,13 +223,67 @@ async function ensureBoundWorkspaceForProject(
     }
   }
   const resolvedPreset = pluginRegistry.getPreset(presetId || proj.preset_id).manifest.id;
-  const wsName = (preferredName || proj.title || '新代码仓库').trim().slice(0, 40);
+  const defaultWsName = resolvedPreset === 'deep-research' ? '新深度研究' : '新代码仓库';
+  const wsName = (preferredName || proj.title || defaultWsName).trim().slice(0, 40);
   const ws = dbStore.createWorkspace(owner, wsName, resolvedPreset);
   await previewManager.ensureWorkspace(ws.id, ws.preset_id);
-  dbStore.updateProject(projectId, { workspaceId: ws.id });
+  dbStore.updateProject(projectId, { workspaceId: ws.id, presetId: resolvedPreset });
   const wsDto = enrichWorkspace(ws)!;
   eventBus.emitUser(owner, { type: 'workspace_updated', workspace: wsDto });
   return { workspace: ws, created: true };
+}
+
+function buildHandoffContext(
+  sourceProject: { id: string; title: string; preset_id: string },
+  sourceWorkspace: WorkspaceRow | undefined,
+  history: ReturnType<typeof dbStore.listMessages>,
+): string {
+  const sourceAgent = pluginRegistry.getPreset(sourceWorkspace?.preset_id || sourceProject.preset_id);
+  const sections: string[] = [
+    `This thread was automatically forked from another conversation ("${sourceProject.title}", Agent: ${sourceAgent.manifest.name}).`,
+  ];
+
+  // If coming from a Deep Research workspace, attach key excerpts of report.md + sources count
+  if (sourceWorkspace && pluginRegistry.canonicalAgentId(sourceWorkspace.preset_id) === 'deep-research') {
+    const wsDir = previewManager.getWorkspaceDir(sourceWorkspace.id);
+    const reportPath = path.join(wsDir, 'report.md');
+    const sourcesPath = path.join(wsDir, 'sources.json');
+    try {
+      if (fs.existsSync(reportPath)) {
+        const reportText = fs.readFileSync(reportPath, 'utf8').trim();
+        if (reportText) {
+          sections.push(
+            '### Source Deep Research Report Excerpt (`report.md`)',
+            reportText.slice(0, 4000) + (reportText.length > 4000 ? '\n...(truncated)' : ''),
+          );
+        }
+      }
+      if (fs.existsSync(sourcesPath)) {
+        const rawSources = JSON.parse(fs.readFileSync(sourcesPath, 'utf8'));
+        if (Array.isArray(rawSources) && rawSources.length > 0) {
+          const topSources = rawSources
+            .slice(0, 10)
+            .map((s: { id?: number; title?: string; url?: string }, i: number) =>
+              `[${s.id ?? i + 1}] ${s.title || s.url} (${s.url || ''})`,
+            )
+            .join('\n');
+          sections.push('### Key Verified Sources', topSources);
+        }
+      }
+    } catch {
+      // ignore read errors on optional handoff artifacts
+    }
+  }
+
+  const recentMsgs = history
+    .filter((m) => m.metadata?.mode !== 'handoff')
+    .slice(-6)
+    .map((m) => `- ${m.role}: ${m.content.slice(0, 400)}`);
+  if (recentMsgs.length > 0) {
+    sections.push('### Recent Source Thread Discussion', ...recentMsgs);
+  }
+
+  return sections.join('\n\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -528,17 +597,20 @@ app.post('/api/projects/:id/bind-workspace', requireAuth, async (req: Authentica
     res.status(404).json({ error: 'Project not found' });
     return;
   }
-  const { workspaceId, createNew, name } = (req.body || {}) as {
+  const { workspaceId, createNew, name, presetId } = (req.body || {}) as {
     workspaceId?: string;
     createNew?: boolean;
     name?: string;
+    presetId?: string;
   };
 
   try {
     let targetWs: WorkspaceRow;
     if (createNew || !workspaceId) {
-      const wsName = (name || (row.title !== '新对话' ? row.title : '新代码项目')).trim().slice(0, 40);
-      targetWs = dbStore.createWorkspace(row.owner, wsName, row.preset_id);
+      const resolvedPreset = pluginRegistry.getPreset(presetId || row.preset_id).manifest.id;
+      const defaultName = resolvedPreset === 'deep-research' ? '新研究空间' : '新代码项目';
+      const wsName = (name || (row.title !== '新对话' ? row.title : defaultName)).trim().slice(0, 40);
+      targetWs = dbStore.createWorkspace(row.owner, wsName, resolvedPreset);
       await previewManager.ensureWorkspace(targetWs.id, targetWs.preset_id);
     } else {
       const found = assertOwnedWorkspace(req, workspaceId);
@@ -550,7 +622,10 @@ app.post('/api/projects/:id/bind-workspace', requireAuth, async (req: Authentica
       await previewManager.ensureWorkspace(targetWs.id, targetWs.preset_id);
     }
 
-    const updated = dbStore.updateProject(row.id, { workspaceId: targetWs.id })!;
+    const updated = dbStore.updateProject(row.id, {
+      workspaceId: targetWs.id,
+      presetId: pluginRegistry.canonicalAgentId(targetWs.preset_id),
+    })!;
     const projDto = enrichProject(updated)!;
     const wsDto = enrichWorkspace(targetWs)!;
     eventBus.emit(row.id, { type: 'project_updated', project: projDto });
@@ -599,7 +674,11 @@ app.post('/api/projects/:id/messages', requireAuth, async (req: AuthenticatedReq
     return;
   }
 
-  const { content, forceBuild } = (req.body || {}) as { content?: string; forceBuild?: boolean };
+  const { content, forceBuild, targetAgentId: rawTargetAgent } = (req.body || {}) as {
+    content?: string;
+    forceBuild?: boolean;
+    targetAgentId?: string;
+  };
   const text = (content || '').trim();
   if (!text) {
     res.status(400).json({ error: 'Message content is required' });
@@ -611,38 +690,63 @@ app.post('/api/projects/:id/messages', requireAuth, async (req: AuthenticatedReq
   eventBus.emit(row.id, { type: 'message_created', message: userMsg });
 
   const isFirstTurn = historyBefore.length === 0;
+  const existingWs = row.workspace_id ? dbStore.getWorkspace(row.workspace_id) : undefined;
+  const hasWs = Boolean(existingWs);
+  const currentAgentId = existingWs ? pluginRegistry.canonicalAgentId(existingWs.preset_id) : null;
 
-  // If this thread is already running or queued, steer / append directly
-  if (piManager.isRunning(row.id) && row.workspace_id) {
-    const ws = dbStore.getWorkspace(row.workspace_id);
-    if (ws) {
-      try {
-        const workspaceDir = previewManager.getWorkspaceDir(ws.id);
-        const appCtx = { owner: ws.owner, presetId: ws.preset_id };
-        const result = await piManager.startOrSteer({
-          owner: row.owner,
-          projectId: row.id,
-          workspaceId: ws.id,
-          presetId: ws.preset_id,
-          workspaceDir,
-          userMessage: text,
-          history: historyBefore,
-          isInitialBuild: false,
-          onSettled: async (wsId) => previewManager.restartApp(wsId, appCtx, true),
-        });
-        res.json({ mode: result.mode, userMessage: userMsg, runId: result.runId, messageId: result.messageId });
-      } catch (err) {
-        res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
-      }
-      return;
+  const explicitTargetAgent =
+    rawTargetAgent && pluginRegistry.hasAgent(rawTargetAgent)
+      ? pluginRegistry.canonicalAgentId(rawTargetAgent)
+      : null;
+
+  const isCurrentlyRunning = piManager.isRunning(row.id) && Boolean(existingWs);
+
+  const decision = explicitTargetAgent
+    ? { intent: 'run_agent' as const, targetAgentId: explicitTargetAgent, title: undefined, reason: 'explicit_agent_mode' }
+    : forceBuild
+      ? {
+          intent: 'run_agent' as const,
+          targetAgentId: currentAgentId || pluginRegistry.canonicalAgentId(row.preset_id),
+          title: undefined,
+          reason: 'explicit_button',
+        }
+      : await classifyIntent(historyBefore, text, hasWs, currentAgentId);
+
+  // If this thread is currently running and the new message stays on the SAME agent (or is a follow-up steering note),
+  // steer directly into the active run. If it routes to a DIFFERENT agent, fall through to cross-agent auto-fork!
+  const wantsDifferentAgent =
+    decision.intent === 'run_agent' &&
+    Boolean(decision.targetAgentId) &&
+    Boolean(currentAgentId) &&
+    pluginRegistry.canonicalAgentId(decision.targetAgentId) !== currentAgentId;
+
+  if (isCurrentlyRunning && existingWs && !wantsDifferentAgent) {
+    try {
+      const workspaceDir = previewManager.getWorkspaceDir(existingWs.id);
+      const appCtx = { owner: existingWs.owner, presetId: existingWs.preset_id };
+      const result = await piManager.startOrSteer({
+        owner: row.owner,
+        projectId: row.id,
+        workspaceId: existingWs.id,
+        presetId: existingWs.preset_id,
+        workspaceDir,
+        userMessage: text,
+        history: historyBefore,
+        isInitialBuild: false,
+        onSettled: async (wsId) => previewManager.restartApp(wsId, appCtx, true),
+      });
+      res.json({
+        mode: result.mode,
+        targetAgentId: currentAgentId,
+        userMessage: userMsg,
+        runId: result.runId,
+        messageId: result.messageId,
+      });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
     }
+    return;
   }
-
-  const hasWs = Boolean(row.workspace_id);
-
-  const decision = forceBuild
-    ? { intent: 'build' as const, title: undefined, reason: 'explicit_button' }
-    : await classifyIntent(historyBefore, text, hasWs);
 
   let currentTitle = row.title;
   if (isFirstTurn || row.title === '新对话') {
@@ -656,13 +760,90 @@ app.post('/api/projects/:id/messages', requireAuth, async (req: AuthenticatedReq
     }
   }
 
-  if (decision.intent === 'build') {
+  if (decision.intent === 'run_agent') {
+    const targetAgentId = pluginRegistry.canonicalAgentId(decision.targetAgentId);
+    const targetRecipe = pluginRegistry.getPreset(targetAgentId);
+
+    // Cross-Agent Handoff Rule:
+    // If this thread is ALREADY bound to Agent A and the new message routes to a DIFFERENT Agent B,
+    // automatically fork a clean new Thread + Workspace for Agent B instead of mixing artifacts!
+    if (existingWs && currentAgentId && currentAgentId !== targetAgentId) {
+      try {
+        const forkedTitle = (decision.title || deriveFallbackTitle(text)).trim().slice(0, 40);
+        const newWs = dbStore.createWorkspace(row.owner, forkedTitle, targetAgentId);
+        await previewManager.ensureWorkspace(newWs.id, newWs.preset_id);
+
+        const newProj = dbStore.createProject(row.owner, forkedTitle, targetAgentId, newWs.id);
+        const forkedUserMsg = dbStore.addMessage(newProj.id, 'user', text);
+
+        const handoffContext = buildHandoffContext(row, existingWs, historyBefore);
+        const handoffContent = `检测到本条需求更适合由 **${targetRecipe.manifest.name}** 执行。为避免与当前工作区混杂，已自动为你创建新对话「${newProj.title}」并传递上下文，正在新对话中启动执行。`;
+        const handoffMessage = dbStore.addMessage(row.id, 'assistant', handoffContent, {
+          mode: 'handoff',
+          agentId: targetAgentId,
+          handoff: {
+            targetProjectId: newProj.id,
+            targetWorkspaceId: newWs.id,
+            targetAgentId,
+            targetAgentName: targetRecipe.manifest.name,
+            targetTitle: newProj.title,
+            reason: decision.reason,
+          },
+        });
+        eventBus.emit(row.id, { type: 'message_created', message: handoffMessage });
+
+        const wsDto = enrichWorkspace(newWs)!;
+        const projDtoBeforeStart = enrichProject(newProj)!;
+        eventBus.emitUser(row.owner, { type: 'workspace_updated', workspace: wsDto });
+        eventBus.emitUser(row.owner, { type: 'project_updated', project: projDtoBeforeStart });
+
+        const newWorkspaceDir = previewManager.getWorkspaceDir(newWs.id);
+        const newAppCtx = { owner: newWs.owner, presetId: newWs.preset_id };
+        const result = await piManager.startOrSteer({
+          owner: row.owner,
+          projectId: newProj.id,
+          workspaceId: newWs.id,
+          presetId: newWs.preset_id,
+          workspaceDir: newWorkspaceDir,
+          userMessage: text,
+          history: [forkedUserMsg],
+          isInitialBuild: true,
+          handoffContext,
+          onSettled: async (wsId) => previewManager.restartApp(wsId, newAppCtx, true),
+        });
+
+        const spawnedProject = enrichProject(dbStore.getProject(newProj.id))!;
+        const spawnedWorkspace = enrichWorkspace(dbStore.getWorkspace(newWs.id))!;
+        res.json({
+          mode: 'handoff',
+          targetAgentId,
+          userMessage: userMsg,
+          handoffMessage,
+          spawnedProject,
+          spawnedWorkspace,
+          runId: result.runId,
+          messageId: result.messageId,
+        });
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        const failMsg = dbStore.addMessage(row.id, 'assistant', `无法创建新对话启动 ${targetRecipe.manifest.name}：${errMsg}`, {
+          mode: 'build',
+          agentId: targetAgentId,
+          error: errMsg,
+        });
+        eventBus.emit(row.id, { type: 'message_created', message: failMsg });
+        res.status(400).json({ error: errMsg });
+      }
+      return;
+    }
+
+    // Same agent OR unbound blank thread -> execute directly in current Thread
     try {
       const { workspace, created } = await ensureBoundWorkspaceForProject(
         row.id,
         row.owner,
         currentTitle,
-        row.preset_id,
+        targetAgentId,
       );
       const workspaceDir = previewManager.getWorkspaceDir(workspace.id);
       const appCtx = { owner: workspace.owner, presetId: workspace.preset_id };
@@ -679,14 +860,18 @@ app.post('/api/projects/:id/messages', requireAuth, async (req: AuthenticatedReq
       });
       res.json({
         mode: result.mode === 'queued' ? 'queued' : 'build',
+        targetAgentId,
         userMessage: userMsg,
         runId: result.runId,
         messageId: result.messageId,
+        project: enrichProject(dbStore.getProject(row.id))!,
+        workspace: enrichWorkspace(dbStore.getWorkspace(workspace.id))!,
       });
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      const failMsg = dbStore.addMessage(row.id, 'assistant', `无法启动构建 Agent：${errMsg}`, {
+      const failMsg = dbStore.addMessage(row.id, 'assistant', `无法启动 ${targetRecipe.manifest.name}：${errMsg}`, {
         mode: 'build',
+        agentId: targetAgentId,
         error: errMsg,
       });
       eventBus.emit(row.id, { type: 'message_created', message: failMsg });

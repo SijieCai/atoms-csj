@@ -333,11 +333,18 @@ export const dbStore = {
 
   updateProject(
     id: string,
-    patch: { title?: string; status?: ProjectStatus; hasWorkspace?: boolean; workspaceId?: string | null },
+    patch: {
+      title?: string;
+      presetId?: string;
+      status?: ProjectStatus;
+      hasWorkspace?: boolean;
+      workspaceId?: string | null;
+    },
   ): ProjectRow | undefined {
     const current = this.getProject(id);
     if (!current) return undefined;
     const title = patch.title ?? current.title;
+    const presetId = patch.presetId ?? current.preset_id;
     const status = patch.status ?? current.status;
     const workspaceId = patch.workspaceId === undefined ? current.workspace_id : patch.workspaceId;
     const hasWorkspace =
@@ -353,15 +360,16 @@ export const dbStore = {
     const now = Date.now();
     db.prepare(`
       UPDATE projects
-      SET title = ?, status = ?, workspace_id = ?, has_workspace = ?, updated_at = ?
+      SET title = ?, preset_id = ?, status = ?, workspace_id = ?, has_workspace = ?, updated_at = ?
       WHERE id = ?
-    `).run(title, status, workspaceId, hasWorkspace, now, id);
+    `).run(title, presetId, status, workspaceId, hasWorkspace, now, id);
     if (workspaceId) {
       this.touchWorkspace(workspaceId);
     }
     return {
       ...current,
       title,
+      preset_id: presetId,
       status,
       workspace_id: workspaceId,
       has_workspace: hasWorkspace,
