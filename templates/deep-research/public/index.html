@@ -1,0 +1,510 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Atoms Deep Research — 研究报告</title>
+    <style>
+      :root {
+        --bg: #f8fafc;
+        --panel: #ffffff;
+        --border: #e2e8f0;
+        --text: #0f172a;
+        --muted: #64748b;
+        --accent: #0f766e;
+        --accent-soft: #f0fdfa;
+        --accent-border: #99f6e4;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        line-height: 1.7;
+      }
+      header {
+        position: sticky;
+        top: 0;
+        z-index: 20;
+        background: rgba(255, 255, 255, 0.92);
+        backdrop-filter: blur(8px);
+        border-bottom: 1px solid var(--border);
+        padding: 10px 20px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-weight: 600;
+        font-size: 14px;
+      }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        padding: 2px 10px;
+        border-radius: 999px;
+        background: var(--accent-soft);
+        border: 1px solid var(--accent-border);
+        color: var(--accent);
+        font-size: 12px;
+        font-weight: 500;
+      }
+      .tabs {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .tab-btn {
+        border: 1px solid transparent;
+        background: transparent;
+        color: var(--muted);
+        padding: 5px 12px;
+        border-radius: 8px;
+        font-size: 13px;
+        cursor: pointer;
+        font-weight: 500;
+      }
+      .tab-btn.active {
+        background: #0f172a;
+        color: #fff;
+      }
+      .tab-btn:hover:not(.active) {
+        background: #f1f5f9;
+        color: var(--text);
+      }
+      .actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .btn {
+        border: 1px solid var(--border);
+        background: #fff;
+        color: var(--text);
+        padding: 5px 10px;
+        border-radius: 8px;
+        font-size: 12px;
+        cursor: pointer;
+        text-decoration: none;
+      }
+      .btn:hover { background: #f1f5f9; }
+      .layout {
+        max-width: 1180px;
+        margin: 0 auto;
+        padding: 24px 20px 64px;
+        display: grid;
+        grid-template-columns: 220px minmax(0, 1fr);
+        gap: 24px;
+      }
+      @media (max-width: 860px) {
+        .layout { grid-template-columns: 1fr; }
+        .toc { display: none; }
+      }
+      .toc {
+        position: sticky;
+        top: 68px;
+        align-self: start;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 14px;
+        max-height: calc(100vh - 96px);
+        overflow-y: auto;
+      }
+      .toc-title {
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--muted);
+        margin-bottom: 8px;
+      }
+      .toc a {
+        display: block;
+        color: var(--muted);
+        text-decoration: none;
+        font-size: 12.5px;
+        padding: 4px 6px;
+        border-radius: 6px;
+        line-height: 1.4;
+      }
+      .toc a:hover { background: #f1f5f9; color: var(--text); }
+      .toc a.h3 { padding-left: 16px; font-size: 12px; }
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 28px 32px;
+        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+      }
+      .markdown h1 { font-size: 26px; margin: 0 0 16px; line-height: 1.3; border-bottom: 1px solid var(--border); padding-bottom: 12px; }
+      .markdown h2 { font-size: 19px; margin: 28px 0 10px; line-height: 1.35; color: #0f172a; }
+      .markdown h3 { font-size: 15.5px; margin: 20px 0 8px; color: #1e293b; }
+      .markdown p { margin: 10px 0; font-size: 14.5px; }
+      .markdown ul, .markdown ol { padding-left: 22px; margin: 10px 0; font-size: 14.5px; }
+      .markdown li { margin: 5px 0; }
+      .markdown blockquote {
+        margin: 14px 0;
+        padding: 10px 16px;
+        border-left: 3px solid var(--accent);
+        background: var(--accent-soft);
+        border-radius: 0 8px 8px 0;
+        color: #134e4a;
+        font-size: 14px;
+      }
+      .markdown code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        background: #f1f5f9;
+        padding: 1px 5px;
+        border-radius: 4px;
+        font-size: 0.9em;
+      }
+      .markdown pre {
+        background: #0f172a;
+        color: #e2e8f0;
+        padding: 14px;
+        border-radius: 10px;
+        overflow-x: auto;
+        font-size: 12.5px;
+      }
+      .markdown pre code { background: transparent; color: inherit; padding: 0; }
+      .markdown table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 16px 0;
+        font-size: 13.5px;
+      }
+      .markdown th, .markdown td {
+        border: 1px solid var(--border);
+        padding: 8px 10px;
+        text-align: left;
+        vertical-align: top;
+      }
+      .markdown th { background: #f8fafc; font-weight: 600; }
+      .markdown a { color: var(--accent); text-decoration: none; }
+      .markdown a:hover { text-decoration: underline; }
+      .cite {
+        display: inline-block;
+        padding: 0 5px;
+        margin: 0 1px;
+        border-radius: 5px;
+        background: var(--accent-soft);
+        border: 1px solid var(--accent-border);
+        color: var(--accent);
+        font-size: 11px;
+        font-weight: 600;
+        cursor: pointer;
+        vertical-align: super;
+        text-decoration: none !important;
+      }
+      .sources-grid {
+        display: grid;
+        gap: 12px;
+      }
+      .source-item {
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 14px 16px;
+        background: #fff;
+        transition: border-color 0.2s, box-shadow 0.2s;
+      }
+      .source-item.highlight {
+        border-color: var(--accent);
+        box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.14);
+      }
+      .source-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        margin-bottom: 6px;
+      }
+      .source-title {
+        font-weight: 600;
+        font-size: 14px;
+        color: #0f172a;
+        text-decoration: none;
+      }
+      .source-title:hover { color: var(--accent); text-decoration: underline; }
+      .source-meta { font-size: 12px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 8px; }
+      .source-summary { margin: 6px 0 0; font-size: 13px; color: #334155; }
+      .empty {
+        text-align: center;
+        padding: 48px 16px;
+        color: var(--muted);
+        font-size: 14px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="brand">
+        <span>🔬 Deep Research Report</span>
+        <span id="sourceCountBadge" class="badge">0 条信源</span>
+      </div>
+      <div class="tabs">
+        <button class="tab-btn active" data-view="report">研究报告</button>
+        <button class="tab-btn" data-view="sources">信源清单</button>
+        <button class="tab-btn" data-view="plan">研究计划</button>
+      </div>
+      <div class="actions">
+        <button id="refreshBtn" class="btn">刷新</button>
+        <a class="btn" href="./api/report.md" download="research-report.md">导出 Markdown</a>
+      </div>
+    </header>
+
+    <div class="layout">
+      <aside class="toc">
+        <div class="toc-title">目录大纲</div>
+        <div id="tocList"></div>
+      </aside>
+      <main id="contentCard" class="card markdown"></main>
+    </div>
+
+    <script>
+      let state = { view: 'report', report: '', plan: '', sources: [], notes: [] };
+
+      function escapeHtml(str) {
+        return String(str || '')
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;');
+      }
+
+      function renderInline(text) {
+        let s = escapeHtml(text);
+        s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
+        s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+        s = s.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+        s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+        s = s.replace(/\[(\d{1,3})\]/g, '<a class="cite" href="#source-$1" data-cite="$1">[$1]</a>');
+        return s;
+      }
+
+      function renderMarkdown(md) {
+        const lines = String(md || '').replace(/\r\n/g, '\n').split('\n');
+        const out = [];
+        const toc = [];
+        let inCode = false;
+        let codeLines = [];
+        let listType = null;
+        let tableRows = [];
+
+        function flushList() {
+          if (listType) {
+            out.push(listType === 'ol' ? '</ol>' : '</ul>');
+            listType = null;
+          }
+        }
+        function flushTable() {
+          if (!tableRows.length) return;
+          const rows = tableRows.map((r) => r.replace(/^\||\|$/g, '').split('|').map((c) => c.trim()));
+          let html = '<table><thead><tr>' + rows[0].map((c) => '<th>' + renderInline(c) + '</th>').join('') + '</tr></thead><tbody>';
+          for (let i = 1; i < rows.length; i++) {
+            if (rows[i].every((c) => /^:?-+:?$/.test(c))) continue;
+            html += '<tr>' + rows[i].map((c) => '<td>' + renderInline(c) + '</td>').join('') + '</tr>';
+          }
+          html += '</tbody></table>';
+          out.push(html);
+          tableRows = [];
+        }
+
+        for (const line of lines) {
+          if (line.trim().startsWith('```')) {
+            flushList();
+            flushTable();
+            if (inCode) {
+              out.push('<pre><code>' + escapeHtml(codeLines.join('\n')) + '</code></pre>');
+              codeLines = [];
+              inCode = false;
+            } else {
+              inCode = true;
+            }
+            continue;
+          }
+          if (inCode) {
+            codeLines.push(line);
+            continue;
+          }
+
+          if (/^\s*\|.+\|\s*$/.test(line)) {
+            flushList();
+            tableRows.push(line.trim());
+            continue;
+          } else {
+            flushTable();
+          }
+
+          const heading = line.match(/^(#{1,4})\s+(.+)$/);
+          if (heading) {
+            flushList();
+            const level = heading[1].length;
+            const title = heading[2].trim();
+            const slug = 'h-' + toc.length;
+            if (level >= 2 && level <= 3) {
+              toc.push({ level, title, slug });
+            }
+            out.push(`<h${level} id="${slug}">${renderInline(title)}</h${level}>`);
+            continue;
+          }
+
+          const ul = line.match(/^\s*[-*+]\s+(.+)$/);
+          if (ul) {
+            if (listType !== 'ul') {
+              flushList();
+              out.push('<ul>');
+              listType = 'ul';
+            }
+            out.push('<li>' + renderInline(ul[1]) + '</li>');
+            continue;
+          }
+
+          const ol = line.match(/^\s*\d+\.\s+(.+)$/);
+          if (ol) {
+            if (listType !== 'ol') {
+              flushList();
+              out.push('<ol>');
+              listType = 'ol';
+            }
+            out.push('<li>' + renderInline(ol[1]) + '</li>');
+            continue;
+          }
+
+          flushList();
+
+          if (/^\s*>\s?/.test(line)) {
+            out.push('<blockquote>' + renderInline(line.replace(/^\s*>\s?/, '')) + '</blockquote>');
+            continue;
+          }
+
+          if (/^\s*---+\s*$/.test(line)) {
+            out.push('<hr style="border:none;border-top:1px solid #e2e8f0;margin:20px 0;" />');
+            continue;
+          }
+
+          if (!line.trim()) continue;
+          out.push('<p>' + renderInline(line) + '</p>');
+        }
+
+        flushList();
+        flushTable();
+        if (inCode) {
+          out.push('<pre><code>' + escapeHtml(codeLines.join('\n')) + '</code></pre>');
+        }
+        return { html: out.join('\n'), toc };
+      }
+
+      function renderSources() {
+        const list = state.sources || [];
+        if (!list.length) {
+          return '<div class="empty">暂无已收录信源。Deep Research Agent 抓取网页后会自动写入 <code>sources.json</code>。</div>';
+        }
+        return (
+          '<h1>参考信源库 (' + list.length + ')</h1><div class="sources-grid">' +
+          list
+            .map((s, idx) => {
+              const id = s.id ?? idx + 1;
+              const url = escapeHtml(s.url || '#');
+              const title = escapeHtml(s.title || s.url || 'Untitled Source');
+              const domain = escapeHtml(s.domain || '');
+              const type = escapeHtml(s.type || 'web');
+              const rel = escapeHtml(s.reliability || '');
+              const pub = escapeHtml(s.publishedAt || '');
+              const summary = escapeHtml(s.summary || '');
+              return `
+                <div class="source-item" id="source-${id}">
+                  <div class="source-head">
+                    <a class="source-title" href="${url}" target="_blank" rel="noopener noreferrer">[${id}] ${title}</a>
+                    <span class="badge">${type}${rel ? ' · ' + rel : ''}</span>
+                  </div>
+                  <div class="source-meta">
+                    ${domain ? `<span>🌐 ${domain}</span>` : ''}
+                    ${pub ? `<span>📅 ${pub}</span>` : ''}
+                  </div>
+                  ${summary ? `<p class="source-summary">${summary}</p>` : ''}
+                </div>`;
+            })
+            .join('') +
+          '</div>'
+        );
+      }
+
+      function renderView(highlightSourceId) {
+        const card = document.getElementById('contentCard');
+        const tocList = document.getElementById('tocList');
+        document.querySelectorAll('.tab-btn').forEach((btn) => {
+          btn.classList.toggle('active', btn.dataset.view === state.view);
+        });
+        document.getElementById('sourceCountBadge').textContent = `${(state.sources || []).length} 条信源`;
+
+        if (state.view === 'sources') {
+          card.innerHTML = renderSources();
+          tocList.innerHTML = (state.sources || [])
+            .map((s, idx) => `<a href="#source-${s.id ?? idx + 1}">[${s.id ?? idx + 1}] ${escapeHtml((s.title || '').slice(0, 28))}</a>`)
+            .join('') || '<div style="font-size:12px;color:#94a3b8;">暂无信源</div>';
+          if (highlightSourceId) {
+            const el = document.getElementById('source-' + highlightSourceId);
+            if (el) {
+              el.classList.add('highlight');
+              el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }
+          }
+          return;
+        }
+
+        const mdText = state.view === 'plan' ? state.plan : state.report;
+        if (!mdText.trim()) {
+          card.innerHTML = '<div class="empty">研究Agent正在准备中，完成后将在这里实时展示完整研究报告…</div>';
+          tocList.innerHTML = '<div style="font-size:12px;color:#94a3b8;">暂无目录</div>';
+          return;
+        }
+
+        const { html, toc } = renderMarkdown(mdText);
+        card.innerHTML = html;
+        tocList.innerHTML =
+          toc.map((h) => `<a class="h${h.level}" href="#${h.slug}">${escapeHtml(h.title)}</a>`).join('') ||
+          '<div style="font-size:12px;color:#94a3b8;">无二级标题</div>';
+
+        card.querySelectorAll('a.cite').forEach((a) => {
+          a.addEventListener('click', (e) => {
+            e.preventDefault();
+            const cid = a.getAttribute('data-cite');
+            state.view = 'sources';
+            renderView(cid);
+          });
+        });
+      }
+
+      async function loadData() {
+        try {
+          const res = await fetch('./api/research', { cache: 'no-store' });
+          if (!res.ok) return;
+          const data = await res.json();
+          state.report = data.report || '';
+          state.plan = data.plan || '';
+          state.sources = Array.isArray(data.sources) ? data.sources : [];
+          state.notes = Array.isArray(data.notes) ? data.notes : [];
+          renderView();
+        } catch {
+          // ignore
+        }
+      }
+
+      document.querySelectorAll('.tab-btn').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          state.view = btn.dataset.view;
+          renderView();
+        });
+      });
+      document.getElementById('refreshBtn').addEventListener('click', () => loadData());
+      loadData();
+    </script>
+  </body>
+</html>

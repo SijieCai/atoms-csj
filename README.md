@@ -7,8 +7,14 @@
 - **意图识别 + 隔离 Coding Agent**：识别构建全栈网站意图后，在项目专属目录 `data/workspaces/<projectId>/` 启动独立 **Pi (`@earendil-works/pi-coding-agent`)** RPC 子进程，自动开发、安装依赖与编译
 - **实时反馈与双向交互**：SSE 流式展示思考、工具调用、文件编辑与终端日志，运行中支持随时插话（`steer`）或一键停止（`abort`）
 - **真实数据持久化 + 在线预览分享**：内置可扩展的 `sqlite-storage` 插件（`SKILL.md` + `atoms_db` MCP Server + `server/db.js` 代理 SDK），所有建表与 SQL 统一走平台 DB Proxy，自动加用户名前缀（`u_<username>_<project>__<table>`）实现租户隔离，并通过 `/preview/<projectId>/` 提供免登录在线预览
-- **内置 VS Code 编辑器 + 服务端真实 LSP**：每个用户可管理多个项目；进入项目对话模式的右侧面板，可直接查看并操作服务端项目目录树（新建文件/文件夹、编辑、删除、`Cmd/Ctrl+S` 保存与「保存并预览」），前端嵌入 Monaco Editor（VS Code 内核）并通过鉴权 WebSocket（`/api/projects/:id/lsp`）直连服务端每项目独立的 `typescript-language-server`（JSON-RPC 2.0 + 虚拟 URI 隔离），提供跨文件补全、悬停类型提示、转到定义与实时语法/语义诊断
-- **可扩展插件与领域子 Agent 预设**：通过组合 `templates/*` 模板与 `plugins/*` 插件（每个插件可包含 `plugin.json`、`SKILL.md`、MCP Server、运行时环境变量与提示词），在 `presets/presets.json` 中声明即可扩展出不同领域的子 Agent
+- **Built-in VS Code 编辑器 + 服务端真实 LSP**：每个代码仓库/研究空间拥有独立目录，右侧面板可直接浏览和编辑文件（新建、保存、删除），前端嵌入 Monaco Editor（VS Code 内核）并通过鉴权 WebSocket（`/api/workspaces/:wsId/lsp`）直连服务端独立 `typescript-language-server`
+- **Workspace (1) : Thread (N) 领域解耦**：支持多个独立工作区真正并行运行，同一工作区下可开启多个并行对话（聊天气泡并发、写入/构建自动 FIFO 排队，删除对话不删除共享工作区）
+- **声明式多 Agent 配方体系 (`agents/` + `plugins/` + `templates/`)**：
+  - **`agents/fullstack-coder/`**：组合 `templates/fullstack-app` + `plugins/sqlite-storage`（全栈建站 + 租户隔离 SQLite 代理）
+  - **`agents/deep-research/`**：组合 `templates/deep-research` + `plugins/deep-research`（GitHub 热门 `deep-research` Skill + 外网搜索/爬取 `web_research` MCP + 零构建交互式研究报告预览器）
+  - **多 Agent 意图路由与跨 Agent 自动分叉 Thread**：聊天时自动识别意图路由至合适 Agent；若在同一对话中触发不同 Agent（例如研究完转去建站），系统自动新建独立 Thread 并传递上下文摘要（如 `report.md`），不污染原工作区
+
+> 研发与维护规范：请先阅读 [`CONTRIBUTING.md`](./CONTRIBUTING.md)（一需求一分支规范 + 先沉淀文档到 [`docs/`](./docs/README.md) 再编码）。
 
 ---
 

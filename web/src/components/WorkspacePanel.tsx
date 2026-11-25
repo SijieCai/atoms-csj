@@ -13,6 +13,8 @@ import {
   Puzzle,
   Table2,
   FolderGit2,
+  FlaskConical,
+  BookOpen,
   Clock,
 } from 'lucide-react';
 import type { AgentPresetSummary, FileTreeNode, TableInfoDTO, WorkspaceDTO } from '@atoms/shared';
@@ -23,6 +25,7 @@ export type WorkspaceTabKey = 'preview' | 'code' | 'database' | 'logs';
 
 interface WorkspacePanelProps {
   workspace: WorkspaceDTO;
+  agent?: AgentPresetSummary | null;
   previewRevision: number;
   isBuilding: boolean;
   requestedTab?: { tab: WorkspaceTabKey; nonce: number } | null;
@@ -30,11 +33,23 @@ interface WorkspacePanelProps {
 
 export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
   workspace,
+  agent,
   previewRevision,
   isBuilding,
   requestedTab,
 }) => {
-  const [tab, setTab] = useState<WorkspaceTabKey>(requestedTab?.tab || 'preview');
+  const isResearch = workspace.presetId === 'deep-research' || agent?.icon === 'research';
+  const visibleTabs: WorkspaceTabKey[] = agent?.ui?.tabs?.length
+    ? agent.ui.tabs
+    : isResearch
+      ? ['preview', 'code', 'logs']
+      : ['preview', 'code', 'database', 'logs'];
+  const previewTabLabel = agent?.ui?.previewTabLabel || (isResearch ? '研究报告' : '应用预览');
+  const workspaceLabel = agent?.ui?.workspaceLabel || (isResearch ? '研究空间' : '代码仓库');
+
+  const [tab, setTab] = useState<WorkspaceTabKey>(
+    requestedTab && visibleTabs.includes(requestedTab.tab) ? requestedTab.tab : 'preview',
+  );
   const [iframeNonce, setIframeNonce] = useState(0);
   const [copied, setCopied] = useState(false);
   const [restarting, setRestarting] = useState(false);
@@ -62,10 +77,10 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
   const workspaceBusy = Boolean(workspace.activeBuildProjectId) || isBuilding;
 
   useEffect(() => {
-    if (requestedTab) {
+    if (requestedTab && visibleTabs.includes(requestedTab.tab)) {
       setTab(requestedTab.tab);
     }
-  }, [requestedTab]);
+  }, [requestedTab, visibleTabs]);
 
   const loadFiles = useCallback(async () => {
     try {
@@ -154,51 +169,63 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
       {/* Tab Bar */}
       <div className="h-13 px-3 border-b border-slate-200 bg-white flex items-center justify-between gap-2 shrink-0">
         <div className="flex items-center gap-1">
-          <button
-            type="button"
-            onClick={() => setTab('preview')}
-            className={`px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition cursor-pointer ${
-              tab === 'preview' ? 'bg-indigo-50 text-indigo-700' : 'text-slate-600 hover:bg-slate-100'
-            }`}
-          >
-            <Globe className="w-3.5 h-3.5" />
-            预览
-          </button>
-          <button
-            type="button"
-            onClick={() => setTab('code')}
-            className={`px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition cursor-pointer ${
-              tab === 'code' ? 'bg-indigo-50 text-indigo-700' : 'text-slate-600 hover:bg-slate-100'
-            }`}
-          >
-            <Code2 className="w-3.5 h-3.5" />
-            VS Code
-          </button>
-          <button
-            type="button"
-            onClick={() => setTab('database')}
-            className={`px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition cursor-pointer ${
-              tab === 'database' ? 'bg-indigo-50 text-indigo-700' : 'text-slate-600 hover:bg-slate-100'
-            }`}
-          >
-            <Database className="w-3.5 h-3.5" />
-            数据表
-            {tablesInfo && tablesInfo.tables.length > 0 && (
-              <span className="px-1.5 py-0.2 rounded-full bg-emerald-100 text-emerald-700 text-[10px]">
-                {tablesInfo.tables.length}
-              </span>
-            )}
-          </button>
-          <button
-            type="button"
-            onClick={() => setTab('logs')}
-            className={`px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition cursor-pointer ${
-              tab === 'logs' ? 'bg-indigo-50 text-indigo-700' : 'text-slate-600 hover:bg-slate-100'
-            }`}
-          >
-            <TerminalSquare className="w-3.5 h-3.5" />
-            日志
-          </button>
+          {visibleTabs.includes('preview') && (
+            <button
+              type="button"
+              onClick={() => setTab('preview')}
+              className={`px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition cursor-pointer ${
+                tab === 'preview'
+                  ? isResearch
+                    ? 'bg-teal-50 text-teal-700'
+                    : 'bg-indigo-50 text-indigo-700'
+                  : 'text-slate-600 hover:bg-slate-100'
+              }`}
+            >
+              {isResearch ? <BookOpen className="w-3.5 h-3.5" /> : <Globe className="w-3.5 h-3.5" />}
+              {previewTabLabel}
+            </button>
+          )}
+          {visibleTabs.includes('code') && (
+            <button
+              type="button"
+              onClick={() => setTab('code')}
+              className={`px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition cursor-pointer ${
+                tab === 'code' ? 'bg-indigo-50 text-indigo-700' : 'text-slate-600 hover:bg-slate-100'
+              }`}
+            >
+              <Code2 className="w-3.5 h-3.5" />
+              VS Code
+            </button>
+          )}
+          {visibleTabs.includes('database') && (
+            <button
+              type="button"
+              onClick={() => setTab('database')}
+              className={`px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition cursor-pointer ${
+                tab === 'database' ? 'bg-indigo-50 text-indigo-700' : 'text-slate-600 hover:bg-slate-100'
+              }`}
+            >
+              <Database className="w-3.5 h-3.5" />
+              数据表
+              {tablesInfo && tablesInfo.tables.length > 0 && (
+                <span className="px-1.5 py-0.2 rounded-full bg-emerald-100 text-emerald-700 text-[10px]">
+                  {tablesInfo.tables.length}
+                </span>
+              )}
+            </button>
+          )}
+          {visibleTabs.includes('logs') && (
+            <button
+              type="button"
+              onClick={() => setTab('logs')}
+              className={`px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition cursor-pointer ${
+                tab === 'logs' ? 'bg-indigo-50 text-indigo-700' : 'text-slate-600 hover:bg-slate-100'
+              }`}
+            >
+              <TerminalSquare className="w-3.5 h-3.5" />
+              日志
+            </button>
+          )}
         </div>
 
         <div className="flex items-center gap-1.5">
@@ -206,7 +233,7 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
             type="button"
             disabled={restarting || workspaceBusy}
             onClick={() => void handleRestart()}
-            title="重新编译并重启应用预览"
+            title={isResearch ? '刷新并重启报告预览服务' : '重新编译并重启应用预览'}
             className="p-1.5 rounded-lg text-slate-500 hover:text-slate-800 hover:bg-slate-100 disabled:opacity-40 transition cursor-pointer"
           >
             <RotateCcw className={`w-3.5 h-3.5 ${restarting ? 'animate-spin' : ''}`} />
@@ -214,19 +241,38 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
         </div>
       </div>
 
-      {/* Explicit Workspace Context Bar (P0: never confuse which repo is open!) */}
+      {/* Explicit Workspace Context Bar (P0: never confuse which workspace is open!) */}
       <div className="px-3 py-1.5 bg-slate-900 text-slate-200 border-b border-slate-800 flex items-center justify-between gap-2 text-[11px] shrink-0">
         <div className="flex items-center gap-2 min-w-0">
-          <FolderGit2 className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+          {isResearch ? (
+            <FlaskConical className="w-3.5 h-3.5 text-teal-400 shrink-0" />
+          ) : (
+            <FolderGit2 className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+          )}
+          <span
+            className={`text-[10px] px-1.5 py-0.5 rounded font-medium shrink-0 ${
+              isResearch
+                ? 'bg-teal-500/20 text-teal-300 border border-teal-500/30'
+                : 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/30'
+            }`}
+          >
+            {workspaceLabel}
+          </span>
           <span className="font-medium text-white truncate">{workspace.name}</span>
           <span className="font-mono text-[10px] text-slate-400 shrink-0">{workspace.id}</span>
         </div>
         <div className="flex items-center gap-2 shrink-0">
           {workspace.activeBuildProjectId && (
-            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
+            <span
+              className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border ${
+                isResearch
+                  ? 'bg-teal-500/20 text-teal-300 border-teal-500/30'
+                  : 'bg-indigo-500/20 text-indigo-300 border-indigo-500/30'
+              }`}
+            >
               <Loader2 className="w-2.5 h-2.5 animate-spin" />
               <span className="truncate max-w-[140px]">
-                构建中: {workspace.activeBuildTitle || workspace.activeBuildProjectId}
+                {isResearch ? '研究中' : '构建中'}: {workspace.activeBuildTitle || workspace.activeBuildProjectId}
               </span>
             </span>
           )}

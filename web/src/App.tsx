@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import type {
   ActiveRunSnapshot,
+  AgentPresetSummary,
   MessageDTO,
   ProjectDTO,
   SSEEvent,
@@ -33,6 +34,7 @@ export default function App() {
   const [authChecked, setAuthChecked] = useState(false);
   const [username, setUsername] = useState<string | null>(null);
   const [glmConfigured, setGlmConfigured] = useState(true);
+  const [agents, setAgents] = useState<AgentPresetSummary[]>([]);
 
   const [workspaces, setWorkspaces] = useState<WorkspaceDTO[]>([]);
   const [projects, setProjects] = useState<ProjectDTO[]>([]);
@@ -61,6 +63,9 @@ export default function App() {
   const activeWorkspace = activeProject?.workspaceId
     ? workspaces.find((w) => w.id === activeProject.workspaceId) || null
     : null;
+  const activeAgent = activeWorkspace
+    ? agents.find((a) => a.id === activeWorkspace.presetId) || null
+    : null;
 
   const refreshAll = useCallback(async () => {
     const [wsRes, projRes] = await Promise.all([api.listWorkspaces(), api.listProjects()]);
@@ -75,6 +80,7 @@ export default function App() {
       .then((res) => {
         setUsername(res.user.username);
         setGlmConfigured(res.glmConfigured);
+        setAgents(res.agents || res.presets || []);
         return refreshAll();
       })
       .catch(() => {
@@ -563,23 +569,32 @@ export default function App() {
     setLiveStream(null);
   };
 
-  const handleNewWorkspace = async () => {
-    const name = window.prompt('输入新代码仓库名称：', '新全栈项目');
+  const handleNewWorkspace = async (presetId?: string) => {
+    const isResearch = presetId === 'deep-research';
+    const defaultName = isResearch ? '新深度研究课题' : '新全栈项目';
+    const name = window.prompt(
+      isResearch ? '输入新研究空间名称：' : '输入新代码仓库名称：',
+      defaultName,
+    );
     if (name === null) return;
-    const clean = name.trim() || '新全栈项目';
+    const clean = name.trim() || defaultName;
     try {
-      const wsRes = await api.createWorkspace(clean);
+      const wsRes = await api.createWorkspace(clean, presetId);
       setWorkspaces((prev) =>
         prev.some((w) => w.id === wsRes.workspace.id) ? prev : [wsRes.workspace, ...prev],
       );
-      const projRes = await api.createProject(`${clean} - 主对话`, wsRes.workspace.id);
+      const projRes = await api.createProject(
+        `${clean} - 主对话`,
+        wsRes.workspace.id,
+        wsRes.workspace.presetId,
+      );
       setProjects((prev) =>
         prev.some((p) => p.id === projRes.project.id) ? prev : [projRes.project, ...prev],
       );
-      setRequestedTab({ tab: 'code', nonce: Date.now() });
+      setRequestedTab({ tab: isResearch ? 'preview' : 'code', nonce: Date.now() });
       await handleSelectProject(projRes.project.id);
     } catch (err) {
-      alert(err instanceof Error ? err.message : '创建代码仓库失败');
+      alert(err instanceof Error ? err.message : '创建工作区失败');
     }
   };
 
@@ -628,7 +643,12 @@ export default function App() {
     );
   };
 
-  const handleBindWorkspace = async (opts: { workspaceId?: string; createNew?: boolean; name?: string }) => {
+  const handleBindWorkspace = async (opts: {
+    workspaceId?: string;
+    createNew?: boolean;
+    name?: string;
+    presetId?: string;
+  }) => {
     if (!activeProjectId) return;
     try {
       const res = await api.bindWorkspace(activeProjectId, opts);
@@ -639,16 +659,22 @@ export default function App() {
           : [res.workspace, ...prev];
       });
       setProjects((prev) => prev.map((p) => (p.id === res.project.id ? res.project : p)));
-      setRequestedTab({ tab: 'code', nonce: Date.now() });
+      setRequestedTab({
+        tab: res.workspace.presetId === 'deep-research' ? 'preview' : 'code',
+        nonce: Date.now(),
+      });
     } catch (err) {
-      alert(err instanceof Error ? err.message : '关联代码仓库失败');
+      alert(err instanceof Error ? err.message : '关联工作区失败');
     }
   };
 
-  const handleSend = async (text: string, forceBuild = false) => {
+  const handleSend = async (
+    text: string,
+    opts?: { forceBuild?: boolean; targetAgentId?: string },
+  ) => {
     let targetProjectId = activeProjectId;
     if (!targetProjectId) {
-      const created = await api.createProject(text.slice(0, 20), null);
+      const created = await api.createProject(text.slice(0, 20), null, opts?.targetAgentId);
       targetProjectId = created.project.id;
       activeProjectIdRef.current = targetProjectId;
       lastStreamSeqRef.current = 0;
@@ -659,10 +685,47 @@ export default function App() {
     }
 
     try {
-      const res = await api.sendMessage(targetProjectId, text, forceBuild);
-      setMessages((prev) =>
-        prev.some((m) => m.id === res.userMessage.id) ? prev : [...prev, res.userMessage],
-      );
+      const res = await api.sendMessage(targetProjectId, text, opts);
+      setMessages((prev) => {
+        let next = prev.some((m) => m.id === res.userMessage.id) ? prev : [...prev, res.userMessage];
+        if (res.handoffMessage && !next.some((m) => m.id === res.handoffMessage!.id)) {
+          next = [...next, res.handoffMessage];
+        }
+        return next;
+      });
+
+      if (res.workspace) {
+        setWorkspaces((prev) =>
+          prev.some((w) => w.id === res.workspace!.id)
+            ? prev.map((w) => (w.id === res.workspace!.id ? res.workspace! : w))
+            : [res.workspace!, ...prev],
+        );
+      }
+      if (res.project) {
+        setProjects((prev) =>
+          prev.some((p) => p.id === res.project!.id)
+            ? prev.map((p) => (p.id === res.project!.id ? res.project! : p))
+            : [res.project!, ...prev],
+        );
+      }
+
+      // Cross-Agent auto-fork: immediately register spawned Workspace & Thread and focus the new Thread!
+      if (res.mode === 'handoff' && res.spawnedProject) {
+        if (res.spawnedWorkspace) {
+          setWorkspaces((prev) =>
+            prev.some((w) => w.id === res.spawnedWorkspace!.id)
+              ? prev.map((w) => (w.id === res.spawnedWorkspace!.id ? res.spawnedWorkspace! : w))
+              : [res.spawnedWorkspace!, ...prev],
+          );
+        }
+        setProjects((prev) =>
+          prev.some((p) => p.id === res.spawnedProject!.id)
+            ? prev.map((p) => (p.id === res.spawnedProject!.id ? res.spawnedProject! : p))
+            : [res.spawnedProject!, ...prev],
+        );
+        setRequestedTab({ tab: 'preview', nonce: Date.now() });
+        await handleSelectProject(res.spawnedProject.id);
+      }
     } catch (err) {
       alert(err instanceof Error ? err.message : '发送失败');
     }
@@ -702,7 +765,10 @@ export default function App() {
       <LoginPage
         onSuccess={(u) => {
           setUsername(u);
-          void api.me().then((res) => setGlmConfigured(res.glmConfigured));
+          void api.me().then((res) => {
+            setGlmConfigured(res.glmConfigured);
+            setAgents(res.agents || res.presets || []);
+          });
           void refreshAll();
         }}
       />
@@ -713,13 +779,14 @@ export default function App() {
     <div className="h-screen w-screen flex overflow-hidden bg-slate-50">
       <Sidebar
         username={username}
+        agents={agents}
         workspaces={workspaces}
         projects={projects}
         activeProjectId={activeProjectId}
         unreadCompletions={unreadCompletions}
         onSelectProject={(id) => void handleSelectProject(id)}
         onNewChat={handleNewChat}
-        onNewWorkspace={() => void handleNewWorkspace()}
+        onNewWorkspace={(presetId) => void handleNewWorkspace(presetId)}
         onNewThreadInWorkspace={(wsId) => void handleNewThreadInWorkspace(wsId)}
         onDeleteProject={(id) => void handleDeleteProject(id)}
         onDeleteWorkspace={(wsId) => void handleDeleteWorkspace(wsId)}
@@ -727,6 +794,7 @@ export default function App() {
       />
 
       <ChatPanel
+        agents={agents}
         project={activeProject}
         workspace={activeWorkspace}
         workspaces={workspaces}
@@ -742,6 +810,7 @@ export default function App() {
           setPreviewRevision((n) => n + 1);
         }}
         onOpenVsCode={() => setRequestedTab({ tab: 'code', nonce: Date.now() })}
+        onSelectProject={(id) => void handleSelectProject(id)}
         onBindWorkspace={handleBindWorkspace}
       />
 
@@ -750,6 +819,7 @@ export default function App() {
         <WorkspacePanel
           key={activeWorkspace.id}
           workspace={activeWorkspace}
+          agent={activeAgent}
           previewRevision={previewRevision}
           isBuilding={isBuilding}
           requestedTab={requestedTab}

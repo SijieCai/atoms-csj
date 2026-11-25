@@ -10,13 +10,24 @@ export interface AgentToolStep {
   output?: string;
 }
 
+export interface HandoffMetadata {
+  targetProjectId: string;
+  targetWorkspaceId?: string | null;
+  targetAgentId: string;
+  targetAgentName: string;
+  targetTitle: string;
+  reason?: string;
+}
+
 export interface MessageMetadata {
-  mode?: 'chat' | 'build';
+  mode?: 'chat' | 'build' | 'handoff';
+  agentId?: string;
   thinking?: string;
   steps?: AgentToolStep[];
   previewUrl?: string;
   aborted?: boolean;
   error?: string;
+  handoff?: HandoffMetadata;
 }
 
 export interface PluginSummary {
@@ -28,13 +39,41 @@ export interface PluginSummary {
   mcpServerName?: string;
 }
 
+export type AgentIconType = 'code' | 'research' | 'bot';
+export type AgentWorkspaceTab = 'preview' | 'code' | 'database' | 'logs';
+
+export interface AgentStarterPrompt {
+  title: string;
+  prompt: string;
+}
+
+export interface AgentIntentSpec {
+  description: string;
+  keywords?: string[];
+  examples?: string[];
+}
+
+export interface AgentUISpec {
+  workspaceLabel: string;
+  previewTabLabel: string;
+  tabs: AgentWorkspaceTab[];
+  starterPrompts: AgentStarterPrompt[];
+}
+
 export interface AgentPresetSummary {
   id: string;
+  aliases?: string[];
   name: string;
+  shortName: string;
+  icon: AgentIconType;
   description: string;
   templateId: string;
   plugins: PluginSummary[];
+  intent?: AgentIntentSpec;
+  ui: AgentUISpec;
 }
+
+export type AgentRecipeSummary = AgentPresetSummary;
 
 export interface TableColumnDTO {
   name: string;
