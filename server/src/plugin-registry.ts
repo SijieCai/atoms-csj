@@ -202,6 +202,8 @@ class PluginRegistry {
     fs.mkdirSync(piAgentDir, { recursive: true });
 
     // 1. Write models.json for GLM
+    const isGlm5Series = /^glm-5/i.test(config.glmModel);
+    const isMultimodal = /flash|v/i.test(config.glmModel);
     const modelsConfig = {
       providers: {
         glm: {
@@ -215,9 +217,9 @@ class PluginRegistry {
               id: config.glmModel,
               name: config.glmModel,
               reasoning: true,
-              input: ['text'],
-              contextWindow: 204800,
-              maxTokens: 16384,
+              input: isMultimodal ? ['text', 'image'] : ['text'],
+              contextWindow: isGlm5Series ? 1_000_000 : 204_800,
+              maxTokens: isGlm5Series ? 65_536 : 16_384,
               cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
               compat: {
                 supportsStore: false,

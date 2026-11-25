@@ -83,6 +83,8 @@ export async function classifyIntent(
   const recent = history.slice(-6).map((m) => `${m.role}: ${m.content.slice(0, 300)}`).join('\n');
   const userPrompt = `hasWorkspace=${hasWorkspace}\n\nRecent conversation:\n${recent || '(empty)'}\n\nLatest user message:\n${latestMessage}`;
 
+  const isGlm53 = /^glm-5\.3/i.test(config.glmChatModel);
+
   try {
     const resp = await fetch(`${config.glmBaseUrl}/chat/completions`, {
       method: 'POST',
@@ -92,14 +94,20 @@ export async function classifyIntent(
       },
       body: JSON.stringify({
         model: config.glmChatModel,
-        temperature: 0.1,
-        max_tokens: 220,
+        temperature: isGlm53 ? 1.0 : 0.1,
+        ...(isGlm53
+          ? {
+              thinking: { type: 'enabled', clear_thinking: false },
+              reasoning_effort: 'low',
+              max_tokens: 1024,
+            }
+          : { max_tokens: 220 }),
         messages: [
           { role: 'system', content: INTENT_SYSTEM_PROMPT },
           { role: 'user', content: userPrompt },
         ],
       }),
-      signal: AbortSignal.timeout(20_000),
+      signal: AbortSignal.timeout(25_000),
     });
 
     if (!resp.ok) {
@@ -145,6 +153,8 @@ export async function streamChatReply(
     { role: 'user', content: latestMessage },
   ];
 
+  const isGlm53 = /^glm-5\.3/i.test(config.glmChatModel);
+
   const resp = await fetch(`${config.glmBaseUrl}/chat/completions`, {
     method: 'POST',
     headers: {
@@ -153,7 +163,14 @@ export async function streamChatReply(
     },
     body: JSON.stringify({
       model: config.glmChatModel,
-      temperature: 0.7,
+      temperature: isGlm53 ? 1.0 : 0.7,
+      ...(isGlm53
+        ? {
+            top_p: 0.95,
+            thinking: { type: 'enabled', clear_thinking: false },
+            reasoning_effort: 'low',
+          }
+        : {}),
       stream: true,
       messages,
     }),

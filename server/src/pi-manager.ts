@@ -31,6 +31,8 @@ function resolvePiCliPath(): string {
 export function ensurePiConfigFile(): void {
   ensureDataDirs();
   const modelsJsonPath = path.join(config.piConfigDir, 'models.json');
+  const isGlm5Series = /^glm-5/i.test(config.glmModel);
+  const isMultimodal = /flash|v/i.test(config.glmModel);
   const modelsConfig = {
     providers: {
       glm: {
@@ -44,9 +46,9 @@ export function ensurePiConfigFile(): void {
             id: config.glmModel,
             name: config.glmModel,
             reasoning: true,
-            input: ['text'],
-            contextWindow: 204800,
-            maxTokens: 16384,
+            input: isMultimodal ? ['text', 'image'] : ['text'],
+            contextWindow: isGlm5Series ? 1_000_000 : 204_800,
+            maxTokens: isGlm5Series ? 65_536 : 16_384,
             cost: {
               input: 0,
               output: 0,
@@ -241,6 +243,8 @@ class PiAgentManager {
       'glm',
       '--model',
       config.glmModel,
+      '--thinking',
+      'high',
       '--session-dir',
       sessionDir,
     ];

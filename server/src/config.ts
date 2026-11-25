@@ -30,8 +30,8 @@ const dataDir = path.isAbsolute(rawDataDir)
   ? rawDataDir
   : path.resolve(REPO_ROOT, rawDataDir);
 
-const glmBaseUrl = (process.env.GLM_BASE_URL || 'https://open.bigmodel.cn/api/coding/paas/v4').replace(/\/+$/, '');
-const glmModel = process.env.GLM_MODEL || 'glm-4.7';
+const glmBaseUrl = (process.env.GLM_BASE_URL || 'https://open.bigmodel.cn/api/paas/v4').replace(/\/+$/, '');
+const glmModel = process.env.GLM_MODEL || 'glm-5.3-flash';
 const glmChatModel = (process.env.GLM_CHAT_MODEL || '').trim() || glmModel;
 
 const demoUsers = parseDemoUsers(

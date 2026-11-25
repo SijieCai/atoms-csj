@@ -31,9 +31,11 @@ npm run dev
 
 ### GLM 端点对照
 
-- **智谱国内 Coding Plan**：`GLM_BASE_URL=https://open.bigmodel.cn/api/coding/paas/v4`，`GLM_MODEL=glm-4.7`（或 `glm-5.2`）
-- **智谱国内通用按量余额**：`GLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4`，`GLM_MODEL=glm-4.7`
-- **海外 Z.AI Coding Plan**：`GLM_BASE_URL=https://api.z.ai/api/coding/paas/v4`，`GLM_MODEL=glm-4.7`
+> 注意：智谱开放平台的 **标准按量 API Key** 与 **GLM Coding Plan 套餐 Key** 互不通用，请按 Key 类型匹配对应 `GLM_BASE_URL`。
+
+- **智谱国内通用按量 API（推荐 `glm-5.3-flash` / `glm-5.3-flashx` / `glm-5.3`）**：`GLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4`，`GLM_MODEL=glm-5.3-flash`（1M 上下文、128K 输出、原生多模态）
+- **智谱国内 GLM Coding Plan 套餐**：`GLM_BASE_URL=https://open.bigmodel.cn/api/coding/paas/v4`，`GLM_MODEL=glm-5.3-flash`（或 `glm-5.3` / `glm-5.4`）
+- **海外 Z.AI Coding Plan**：`GLM_BASE_URL=https://api.z.ai/api/coding/paas/v4`，`GLM_MODEL=glm-5.3-flash`
 
 ---
 
