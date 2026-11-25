@@ -1,4 +1,14 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  BookOpen,
+  Code2,
+  Database,
+  FlaskConical,
+  FolderGit2,
+  Globe,
+  Loader2,
+  PanelRightOpen,
+} from 'lucide-react';
 import type {
   ActiveRunSnapshot,
   AgentPresetSummary,
@@ -45,6 +55,7 @@ export default function App() {
   const [liveStream, setLiveStream] = useState<LiveStreamState | null>(null);
   const [previewRevision, setPreviewRevision] = useState(0);
   const [requestedTab, setRequestedTab] = useState<{ tab: WorkspaceTabKey; nonce: number } | null>(null);
+  const [workspaceCollapsed, setWorkspaceCollapsed] = useState(false);
   const [unreadCompletions, setUnreadCompletions] = useState<
     Record<string, 'succeeded' | 'aborted' | 'failed'>
   >({});
@@ -591,6 +602,7 @@ export default function App() {
       setProjects((prev) =>
         prev.some((p) => p.id === projRes.project.id) ? prev : [projRes.project, ...prev],
       );
+      setWorkspaceCollapsed(false);
       setRequestedTab({ tab: isResearch ? 'preview' : 'code', nonce: Date.now() });
       await handleSelectProject(projRes.project.id);
     } catch (err) {
@@ -659,6 +671,7 @@ export default function App() {
           : [res.workspace, ...prev];
       });
       setProjects((prev) => prev.map((p) => (p.id === res.project.id ? res.project : p)));
+      setWorkspaceCollapsed(false);
       setRequestedTab({
         tab: res.workspace.presetId === 'deep-research' ? 'preview' : 'code',
         nonce: Date.now(),
@@ -723,6 +736,7 @@ export default function App() {
             ? prev.map((p) => (p.id === res.spawnedProject!.id ? res.spawnedProject! : p))
             : [res.spawnedProject!, ...prev],
         );
+        setWorkspaceCollapsed(false);
         setRequestedTab({ tab: 'preview', nonce: Date.now() });
         await handleSelectProject(res.spawnedProject.id);
       }
@@ -806,24 +820,124 @@ export default function App() {
         onSend={handleSend}
         onAbort={handleAbort}
         onOpenPreview={() => {
+          setWorkspaceCollapsed(false);
           setRequestedTab({ tab: 'preview', nonce: Date.now() });
           setPreviewRevision((n) => n + 1);
         }}
-        onOpenVsCode={() => setRequestedTab({ tab: 'code', nonce: Date.now() })}
+        onOpenVsCode={() => {
+          setWorkspaceCollapsed(false);
+          setRequestedTab({ tab: 'code', nonce: Date.now() });
+        }}
+        workspaceCollapsed={workspaceCollapsed}
+        onExpandWorkspace={() => setWorkspaceCollapsed(false)}
         onSelectProject={(id) => void handleSelectProject(id)}
         onBindWorkspace={handleBindWorkspace}
       />
 
       {/* P0: Strictly keyed by activeWorkspace.id so switching workspaces never leaks stale editor/tree/LSP state */}
       {activeWorkspace && (
-        <WorkspacePanel
-          key={activeWorkspace.id}
-          workspace={activeWorkspace}
-          agent={activeAgent}
-          previewRevision={previewRevision}
-          isBuilding={isBuilding}
-          requestedTab={requestedTab}
-        />
+        <>
+          <WorkspacePanel
+            key={activeWorkspace.id}
+            workspace={activeWorkspace}
+            agent={activeAgent}
+            previewRevision={previewRevision}
+            isBuilding={isBuilding}
+            requestedTab={requestedTab}
+            collapsed={workspaceCollapsed}
+            onCollapse={() => setWorkspaceCollapsed(true)}
+          />
+
+          {workspaceCollapsed && (
+            <aside className="w-11 border-l border-slate-200 bg-white flex flex-col items-center py-2.5 gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => setWorkspaceCollapsed(false)}
+                title={`展开右侧${activeWorkspace.presetId === 'deep-research' ? '研究空间' : '代码仓库'}面板`}
+                className="p-2 rounded-lg text-slate-600 hover:text-indigo-700 hover:bg-indigo-50 transition cursor-pointer"
+              >
+                <PanelRightOpen className="w-4 h-4" />
+              </button>
+
+              <div className="w-6 h-px bg-slate-200" />
+
+              {/* Quick direct-expand buttons */}
+              <button
+                type="button"
+                onClick={() => {
+                  setWorkspaceCollapsed(false);
+                  setRequestedTab({ tab: 'preview', nonce: Date.now() });
+                }}
+                title={activeWorkspace.presetId === 'deep-research' ? '展开查看研究报告' : '展开查看应用预览'}
+                className={`p-2 rounded-lg transition cursor-pointer ${
+                  activeWorkspace.presetId === 'deep-research'
+                    ? 'text-teal-600 hover:bg-teal-50'
+                    : 'text-slate-600 hover:text-indigo-700 hover:bg-indigo-50'
+                }`}
+              >
+                {activeWorkspace.presetId === 'deep-research' ? (
+                  <BookOpen className="w-4 h-4" />
+                ) : (
+                  <Globe className="w-4 h-4" />
+                )}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setWorkspaceCollapsed(false);
+                  setRequestedTab({ tab: 'code', nonce: Date.now() });
+                }}
+                title="展开 VS Code 编辑器"
+                className="p-2 rounded-lg text-slate-600 hover:text-indigo-700 hover:bg-indigo-50 transition cursor-pointer"
+              >
+                <Code2 className="w-4 h-4" />
+              </button>
+
+              {activeWorkspace.presetId !== 'deep-research' && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setWorkspaceCollapsed(false);
+                    setRequestedTab({ tab: 'database', nonce: Date.now() });
+                  }}
+                  title="展开 SQLite 数据表"
+                  className="p-2 rounded-lg text-slate-600 hover:text-indigo-700 hover:bg-indigo-50 transition cursor-pointer"
+                >
+                  <Database className="w-4 h-4" />
+                </button>
+              )}
+
+              <div className="flex-1" />
+
+              {/* Docked workspace identity & running indicator */}
+              <button
+                type="button"
+                onClick={() => setWorkspaceCollapsed(false)}
+                title={`${activeWorkspace.name} (${activeWorkspace.id}) — 点击展开`}
+                className="flex flex-col items-center gap-1.5 py-2 px-1 rounded-lg hover:bg-slate-100 transition cursor-pointer"
+              >
+                {activeWorkspace.activeBuildProjectId || isBuilding ? (
+                  <Loader2
+                    className={`w-3.5 h-3.5 animate-spin ${
+                      activeWorkspace.presetId === 'deep-research' ? 'text-teal-600' : 'text-indigo-600'
+                    }`}
+                  />
+                ) : activeWorkspace.presetId === 'deep-research' ? (
+                  <FlaskConical className="w-3.5 h-3.5 text-teal-600" />
+                ) : (
+                  <FolderGit2 className="w-3.5 h-3.5 text-indigo-600" />
+                )}
+                <span
+                  className="text-[11px] font-medium text-slate-500 max-h-28 overflow-hidden truncate"
+                  style={{ writingMode: 'vertical-rl' }}
+                >
+                  {activeWorkspace.name}
+                </span>
+              </button>
+            </aside>
+          )}
+        </>
       )}
     </div>
   );
