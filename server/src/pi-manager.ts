@@ -3,7 +3,7 @@ import path from 'node:path';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import type { ActiveRunSnapshot, AgentToolStep, MessageDTO, MessageMetadata } from '@atoms/shared';
 import { config, ensureDataDirs } from './config.js';
-import { dbStore, generateId, toProjectDTO } from './db.js';
+import { dbStore, generateId, toProjectDTO, toWorkspaceDTO } from './db.js';
 import { eventBus } from './event-bus.js';
 import { pluginRegistry } from './plugin-registry.js';
 
@@ -103,8 +103,21 @@ function extractTextFromToolResult(result: unknown): string {
   return JSON.stringify(obj).slice(0, 800);
 }
 
+export interface StartBuildParams {
+  owner: string;
+  projectId: string;
+  workspaceId: string;
+  presetId?: string;
+  workspaceDir: string;
+  userMessage: string;
+  history: MessageDTO[];
+  isInitialBuild: boolean;
+  onSettled: (workspaceId: string, ok: boolean) => Promise<string | null>;
+}
+
 interface ActiveRun {
   projectId: string;
+  workspaceId: string;
   owner: string;
   runId: string;
   messageId: string;
@@ -123,7 +136,16 @@ interface ActiveRun {
   stderrBuf: string;
   timeoutTimer: NodeJS.Timeout;
   reqSeq: number;
-  onSettled: (projectId: string, ok: boolean) => Promise<string | null>;
+  onSettled: (workspaceId: string, ok: boolean) => Promise<string | null>;
+}
+
+interface QueuedRun {
+  params: StartBuildParams;
+  messageId: string;
+  queuedAt: number;
+  lastActivityAt: number;
+  statusText: string;
+  lastSeq: number;
 }
 
 function summarizeActiveStep(run: ActiveRun): string {
@@ -141,6 +163,9 @@ function summarizeActiveStep(run: ActiveRun): string {
 
 class PiAgentManager {
   private activeRuns = new Map<string, ActiveRun>();
+  private workspaceActiveProject = new Map<string, string>();
+  private workspaceQueues = new Map<string, QueuedRun[]>();
+  private queuedByProject = new Map<string, QueuedRun>();
   private piCliPath: string | null = null;
 
   private getPiCliPath(): string {
@@ -151,46 +176,104 @@ class PiAgentManager {
   }
 
   isRunning(projectId: string): boolean {
-    return this.activeRuns.has(projectId);
+    return this.activeRuns.has(projectId) || this.queuedByProject.has(projectId);
+  }
+
+  isWorkspaceBusy(workspaceId: string): boolean {
+    return this.workspaceActiveProject.has(workspaceId);
   }
 
   getActiveCount(): number {
     return this.activeRuns.size;
   }
 
+  getWorkspaceBuildState(workspaceId: string): {
+    activeBuildProjectId: string | null;
+    activeBuildTitle: string | null;
+    queuedProjectIds: string[];
+  } {
+    const activeProjectId = this.workspaceActiveProject.get(workspaceId) || null;
+    const activeProj = activeProjectId ? dbStore.getProject(activeProjectId) : undefined;
+    const queued = (this.workspaceQueues.get(workspaceId) || []).map((q) => q.params.projectId);
+    return {
+      activeBuildProjectId: activeProjectId,
+      activeBuildTitle: activeProj?.title ?? null,
+      queuedProjectIds: queued,
+    };
+  }
+
   getActiveRunSnapshot(projectId: string): ActiveRunSnapshot | null {
     const run = this.activeRuns.get(projectId);
-    if (!run) return null;
-    return {
-      runId: run.runId,
-      messageId: run.messageId,
-      mode: 'build',
-      startedAt: run.startedAt,
-      lastActivityAt: run.lastActivityAt,
-      statusText: run.statusText,
-      thinking: run.thinkingText,
-      text: run.assistantText,
-      steps: run.steps.map((s) => ({ ...s })),
-      seq: run.lastSeq,
-    };
+    if (run) {
+      return {
+        runId: run.runId,
+        messageId: run.messageId,
+        mode: 'build',
+        queued: false,
+        startedAt: run.startedAt,
+        lastActivityAt: run.lastActivityAt,
+        statusText: run.statusText,
+        thinking: run.thinkingText,
+        text: run.assistantText,
+        steps: run.steps.map((s) => ({ ...s })),
+        seq: run.lastSeq,
+      };
+    }
+
+    const queued = this.queuedByProject.get(projectId);
+    if (queued) {
+      return {
+        messageId: queued.messageId,
+        mode: 'build',
+        queued: true,
+        startedAt: queued.queuedAt,
+        lastActivityAt: queued.lastActivityAt,
+        statusText: queued.statusText,
+        thinking: '',
+        text: '',
+        steps: [],
+        seq: queued.lastSeq,
+      };
+    }
+
+    return null;
   }
 
   getActiveSummary(projectId: string): {
     isBuilding: boolean;
+    queued: boolean;
     activeStep: string | null;
     startedAt: number | null;
     lastActivityAt: number | null;
   } {
     const run = this.activeRuns.get(projectId);
-    if (!run) {
-      return { isBuilding: false, activeStep: null, startedAt: null, lastActivityAt: null };
+    if (run) {
+      return {
+        isBuilding: true,
+        queued: false,
+        activeStep: summarizeActiveStep(run),
+        startedAt: run.startedAt,
+        lastActivityAt: run.lastActivityAt,
+      };
     }
-    return {
-      isBuilding: true,
-      activeStep: summarizeActiveStep(run),
-      startedAt: run.startedAt,
-      lastActivityAt: run.lastActivityAt,
-    };
+    const queued = this.queuedByProject.get(projectId);
+    if (queued) {
+      return {
+        isBuilding: true,
+        queued: true,
+        activeStep: queued.statusText,
+        startedAt: queued.queuedAt,
+        lastActivityAt: queued.lastActivityAt,
+      };
+    }
+    return { isBuilding: false, queued: false, activeStep: null, startedAt: null, lastActivityAt: null };
+  }
+
+  private emitWorkspaceUpdate(owner: string, workspaceId: string, previewRunning = false): void {
+    const ws = dbStore.getWorkspace(workspaceId);
+    if (!ws) return;
+    const dto = toWorkspaceDTO(ws, previewRunning, this.getWorkspaceBuildState(workspaceId));
+    eventBus.emitUser(owner, { type: 'workspace_updated', workspace: dto });
   }
 
   private broadcastActivity(run: ActiveRun, force = false): void {
@@ -210,16 +293,10 @@ class PiAgentManager {
     });
   }
 
-  async startOrSteer(params: {
-    owner: string;
-    projectId: string;
-    presetId?: string;
-    workspaceDir: string;
-    userMessage: string;
-    history: MessageDTO[];
-    isInitialBuild: boolean;
-    onSettled: (projectId: string, ok: boolean) => Promise<string | null>;
-  }): Promise<{ mode: 'started' | 'steered'; runId: string; messageId: string }> {
+  async startOrSteer(
+    params: StartBuildParams,
+  ): Promise<{ mode: 'started' | 'steered' | 'queued'; runId?: string; messageId: string }> {
+    // 1. Same conversation thread already actively running -> live steer
     const existing = this.activeRuns.get(params.projectId);
     if (existing) {
       if (existing.settled) {
@@ -243,27 +320,120 @@ class PiAgentManager {
       return { mode: 'steered', runId: existing.runId, messageId: existing.messageId };
     }
 
+    // 2. Same conversation thread already queued -> merge additional note into queued prompt
+    const existingQueued = this.queuedByProject.get(params.projectId);
+    if (existingQueued) {
+      existingQueued.params.userMessage = `${existingQueued.params.userMessage}\n\n补充要求：\n${params.userMessage}`;
+      existingQueued.lastActivityAt = Date.now();
+      existingQueued.lastSeq = eventBus.emit(params.projectId, {
+        type: 'agent_status',
+        messageId: existingQueued.messageId,
+        statusText: `${existingQueued.statusText}（已合并补充指令）`,
+      });
+      return { mode: 'queued', messageId: existingQueued.messageId };
+    }
+
     if (!config.glmApiKey) {
       throw new Error('服务端未配置 GLM_API_KEY，无法启动 Coding Agent。请在 .env 中配置后重试。');
     }
 
+    // 3. Another conversation thread is currently mutating the SAME workspace -> enqueue safely (write serialization)
+    const blockingProjectId = this.workspaceActiveProject.get(params.workspaceId);
+    if (blockingProjectId && blockingProjectId !== params.projectId) {
+      const blockingProj = dbStore.getProject(blockingProjectId);
+      const blockingTitle = blockingProj?.title || '其他对话';
+      const now = Date.now();
+      const messageId = generateId('msg');
+      dbStore.addMessage(
+        params.projectId,
+        'assistant',
+        '',
+        { mode: 'build', steps: [], thinking: '' },
+        messageId,
+      );
+
+      const queue = this.workspaceQueues.get(params.workspaceId) || [];
+      const position = queue.length + 1;
+      const statusText = `排队中 (#${position})：等待同仓库「${blockingTitle}」完成当前修改...`;
+
+      const updatedProj = dbStore.updateProject(params.projectId, {
+        status: 'queued',
+        workspaceId: params.workspaceId,
+      });
+      const wsRow = dbStore.getWorkspace(params.workspaceId);
+      if (updatedProj) {
+        const dto = {
+          ...toProjectDTO(updatedProj, false, wsRow?.name),
+          activeStep: statusText,
+          lastActivityAt: now,
+        };
+        eventBus.emit(params.projectId, { type: 'project_updated', project: dto });
+        eventBus.emitUser(params.owner, { type: 'project_updated', project: dto });
+      }
+
+      const seq = eventBus.emit(params.projectId, {
+        type: 'agent_queued',
+        messageId,
+        workspaceId: params.workspaceId,
+        position,
+        blockingProjectId,
+        blockingTitle,
+      });
+
+      const entry: QueuedRun = {
+        params,
+        messageId,
+        queuedAt: now,
+        lastActivityAt: now,
+        statusText,
+        lastSeq: seq,
+      };
+      queue.push(entry);
+      this.workspaceQueues.set(params.workspaceId, queue);
+      this.queuedByProject.set(params.projectId, entry);
+
+      eventBus.emitUser(params.owner, {
+        type: 'project_activity',
+        projectId: params.projectId,
+        status: 'queued',
+        isBuilding: true,
+        activeStep: statusText,
+        startedAt: now,
+        lastActivityAt: now,
+      });
+      this.emitWorkspaceUpdate(params.owner, params.workspaceId, false);
+
+      return { mode: 'queued', messageId };
+    }
+
+    // 4. Different workspace or idle workspace -> start immediately
+    return this.launchRun(params);
+  }
+
+  private launchRun(
+    params: StartBuildParams,
+    existingMessageId?: string,
+  ): { mode: 'started'; runId: string; messageId: string } {
     if (this.activeRuns.size >= config.maxConcurrentAgents) {
-      throw new Error(`当前同时构建的项目数已达上限（${config.maxConcurrentAgents}），请稍候再试。`);
+      throw new Error(`当前同时构建的代码仓库数已达上限（${config.maxConcurrentAgents}），请稍候再试。`);
     }
 
     const bundle = pluginRegistry.prepareProjectAgentBundle({
       owner: params.owner,
-      projectId: params.projectId,
+      projectId: params.workspaceId,
       workspaceDir: params.workspaceDir,
       presetId: params.presetId,
     });
-    const sessionDir = path.join(params.workspaceDir, '.pi-sessions');
+    // Per-thread isolated Pi session directory inside the shared workspace
+    const sessionDir = path.join(params.workspaceDir, '.pi-sessions', params.projectId);
     fs.mkdirSync(sessionDir, { recursive: true });
 
-    // Write conversation context file so Pi has full requirement context
+    const wsRow = dbStore.getWorkspace(params.workspaceId);
     const contextMd = [
       '# Project Conversation Context',
       '',
+      `- Workspace: ${wsRow?.name || params.workspaceId} (${params.workspaceId})`,
+      `- Conversation Thread: ${params.projectId}`,
       `- Preset: ${bundle.preset.manifest.id} (${bundle.preset.manifest.name})`,
       `- Loaded Plugins: ${bundle.preset.plugins.map((p) => p.manifest.id).join(', ') || 'none'}`,
       bundle.runtimeEnv.ATOMS_DB_PREFIX
@@ -277,34 +447,30 @@ class PiAgentManager {
 
     const now = Date.now();
     const runId = dbStore.createAgentRun(params.projectId, params.userMessage);
-    const messageId = generateId('msg');
-    dbStore.addMessage(
-      params.projectId,
-      'assistant',
-      '',
-      { mode: 'build', steps: [], thinking: '' },
-      messageId,
-    );
+    const messageId = existingMessageId || generateId('msg');
+    if (!existingMessageId) {
+      dbStore.addMessage(
+        params.projectId,
+        'assistant',
+        '',
+        { mode: 'build', steps: [], thinking: '' },
+        messageId,
+      );
+    }
 
     const initialStatus = '正在隔离工作区启动 Pi Coding Agent...';
     const updatedProj = dbStore.updateProject(params.projectId, {
       status: 'building',
-      hasWorkspace: true,
+      workspaceId: params.workspaceId,
     });
     if (updatedProj) {
       const dto = {
-        ...toProjectDTO(updatedProj, false),
+        ...toProjectDTO(updatedProj, false, wsRow?.name),
         activeStep: initialStatus,
         lastActivityAt: now,
       };
-      eventBus.emit(params.projectId, {
-        type: 'project_updated',
-        project: dto,
-      });
-      eventBus.emitUser(params.owner, {
-        type: 'project_updated',
-        project: dto,
-      });
+      eventBus.emit(params.projectId, { type: 'project_updated', project: dto });
+      eventBus.emitUser(params.owner, { type: 'project_updated', project: dto });
     }
 
     const startSeq = eventBus.emit(params.projectId, {
@@ -354,6 +520,7 @@ class PiAgentManager {
 
     const run: ActiveRun = {
       projectId: params.projectId,
+      workspaceId: params.workspaceId,
       owner: params.owner,
       runId,
       messageId,
@@ -393,7 +560,9 @@ class PiAgentManager {
     };
 
     this.activeRuns.set(params.projectId, run);
+    this.workspaceActiveProject.set(params.workspaceId, params.projectId);
     this.broadcastActivity(run, true);
+    this.emitWorkspaceUpdate(params.owner, params.workspaceId, false);
     this.attachSubprocessHandlers(run);
 
     const agentPrompt = params.isInitialBuild
@@ -409,7 +578,112 @@ class PiAgentManager {
     return { mode: 'started', runId, messageId };
   }
 
+  private drainWorkspaceQueue(workspaceId: string): void {
+    if (this.workspaceActiveProject.has(workspaceId)) return;
+    const queue = this.workspaceQueues.get(workspaceId);
+    if (!queue || queue.length === 0) {
+      this.workspaceQueues.delete(workspaceId);
+      return;
+    }
+
+    const next = queue.shift()!;
+    this.queuedByProject.delete(next.params.projectId);
+    if (queue.length === 0) {
+      this.workspaceQueues.delete(workspaceId);
+    }
+
+    // Refresh queue position notices for any remaining waiting threads
+    const nextProj = dbStore.getProject(next.params.projectId);
+    for (let i = 0; i < queue.length; i++) {
+      const q = queue[i];
+      q.statusText = `排队中 (#${i + 1})：等待同仓库「${nextProj?.title || '前序对话'}」完成当前修改...`;
+      q.lastActivityAt = Date.now();
+      q.lastSeq = eventBus.emit(q.params.projectId, {
+        type: 'agent_status',
+        messageId: q.messageId,
+        statusText: q.statusText,
+      });
+    }
+
+    // Re-read fresh history before launching
+    const freshHistory = dbStore.listMessages(next.params.projectId).filter((m) => m.id !== next.messageId);
+    try {
+      this.launchRun({ ...next.params, history: freshHistory, isInitialBuild: false }, next.messageId);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const saved =
+        dbStore.updateMessage(next.messageId, `排队任务启动失败：${errMsg}`, {
+          mode: 'build',
+          error: errMsg,
+        }) || dbStore.addMessage(next.params.projectId, 'assistant', `排队任务启动失败：${errMsg}`);
+      const updated = dbStore.updateProject(next.params.projectId, { status: 'error' });
+      const wsRow = dbStore.getWorkspace(workspaceId);
+      if (updated) {
+        const dto = toProjectDTO(updated, false, wsRow?.name);
+        eventBus.emit(next.params.projectId, { type: 'project_updated', project: dto });
+        eventBus.emitUser(next.params.owner, {
+          type: 'project_run_finished',
+          projectId: next.params.projectId,
+          status: 'failed',
+          project: dto,
+        });
+      }
+      eventBus.emit(next.params.projectId, {
+        type: 'agent_done',
+        runId: 'queued-failed',
+        message: saved,
+        status: 'failed',
+        error: errMsg,
+      });
+      this.drainWorkspaceQueue(workspaceId);
+    }
+  }
+
   abort(projectId: string): boolean {
+    // 1. Cancel if waiting in workspace queue
+    const queued = this.queuedByProject.get(projectId);
+    if (queued) {
+      this.queuedByProject.delete(projectId);
+      const wsQueue = this.workspaceQueues.get(queued.params.workspaceId);
+      if (wsQueue) {
+        const remaining = wsQueue.filter((q) => q.params.projectId !== projectId);
+        if (remaining.length === 0) this.workspaceQueues.delete(queued.params.workspaceId);
+        else this.workspaceQueues.set(queued.params.workspaceId, remaining);
+      }
+      const savedMsg =
+        dbStore.updateMessage(queued.messageId, '已取消排队中的构建任务。你可以继续输入新的需求。', {
+          mode: 'build',
+          aborted: true,
+        }) ||
+        dbStore.addMessage(projectId, 'assistant', '已取消排队中的构建任务。', {
+          mode: 'build',
+          aborted: true,
+        });
+      const updated = dbStore.updateProject(projectId, { status: 'ready' });
+      const wsRow = dbStore.getWorkspace(queued.params.workspaceId);
+      const dto = updated
+        ? { ...toProjectDTO(updated, false, wsRow?.name), activeStep: null, lastActivityAt: null }
+        : null;
+      if (dto) {
+        eventBus.emit(projectId, { type: 'project_updated', project: dto });
+        eventBus.emitUser(queued.params.owner, {
+          type: 'project_run_finished',
+          projectId,
+          status: 'aborted',
+          project: dto,
+        });
+      }
+      eventBus.emit(projectId, {
+        type: 'agent_done',
+        runId: 'queued-aborted',
+        message: savedMsg,
+        status: 'aborted',
+      });
+      this.emitWorkspaceUpdate(queued.params.owner, queued.params.workspaceId, false);
+      return true;
+    }
+
+    // 2. Abort actively running agent
     const run = this.activeRuns.get(projectId);
     if (!run || run.settled) return false;
     run.aborted = true;
@@ -435,6 +709,17 @@ class PiAgentManager {
     return true;
   }
 
+  abortWorkspace(workspaceId: string): void {
+    const queue = [...(this.workspaceQueues.get(workspaceId) || [])];
+    for (const q of queue) {
+      this.abort(q.params.projectId);
+    }
+    const activeProjId = this.workspaceActiveProject.get(workspaceId);
+    if (activeProjId) {
+      this.abort(activeProjId);
+    }
+  }
+
   shutdownAll(): void {
     for (const run of this.activeRuns.values()) {
       clearTimeout(run.timeoutTimer);
@@ -445,6 +730,9 @@ class PiAgentManager {
       }
     }
     this.activeRuns.clear();
+    this.workspaceActiveProject.clear();
+    this.workspaceQueues.clear();
+    this.queuedByProject.clear();
   }
 
   private writeRpc(child: ChildProcessWithoutNullStreams, payload: Record<string, unknown>): void {
@@ -453,7 +741,6 @@ class PiAgentManager {
   }
 
   private attachSubprocessHandlers(run: ActiveRun): void {
-    // Strict LF-only JSONL framing (do NOT use Node readline, which splits on U+2028/U+2029)
     let stdoutBuf = '';
     run.child.stdout.setEncoding('utf8');
     run.child.stdout.on('data', (chunk: string) => {
@@ -518,7 +805,6 @@ class PiAgentManager {
     }
 
     if (type === 'extension_ui_request') {
-      // Auto-decline interactive TUI dialogs in headless demo mode so agent never stalls
       if (typeof record.id === 'string') {
         this.writeRpc(run.child, {
           type: 'extension_ui_response',
@@ -690,7 +976,6 @@ class PiAgentManager {
     run.settled = true;
     clearTimeout(run.timeoutTimer);
 
-    // Gracefully terminate the per-run Pi RPC subprocess (session state is persisted in .pi-sessions)
     try {
       run.child.stdin.end();
       setTimeout(() => {
@@ -700,9 +985,9 @@ class PiAgentManager {
       // ignore
     }
 
-    // Keep run in activeRuns while preview builds & starts so switching projects during finalization never sees a blank gap
     let previewUrl: string | null = null;
-    if (status === 'succeeded') {
+    const workspaceStillExists = Boolean(dbStore.getWorkspace(run.workspaceId));
+    if (status === 'succeeded' && workspaceStillExists) {
       const statusText = '代码已完成，正在启动全栈应用与 SQLite 数据库预览服务...';
       run.statusText = statusText;
       run.lastActivityAt = Date.now();
@@ -713,7 +998,7 @@ class PiAgentManager {
       });
       this.broadcastActivity(run, true);
       try {
-        previewUrl = await run.onSettled(run.projectId, true);
+        previewUrl = await run.onSettled(run.workspaceId, true);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         error = `预览服务启动失败: ${msg}`;
@@ -738,24 +1023,34 @@ class PiAgentManager {
       error,
     };
 
-    const savedMsg =
-      dbStore.updateMessage(run.messageId, finalContent, metadata) ||
-      dbStore.addMessage(run.projectId, 'assistant', finalContent, metadata);
+    // Thread may have been deleted while the agent process was winding down.
+    const projectStillExists = Boolean(dbStore.getProject(run.projectId));
+    let savedMsg: MessageDTO | null = null;
+    let updatedProj = null;
 
-    dbStore.finishAgentRun(run.runId, status, error);
+    if (projectStillExists) {
+      savedMsg =
+        dbStore.updateMessage(run.messageId, finalContent, metadata) ||
+        dbStore.addMessage(run.projectId, 'assistant', finalContent, metadata);
 
-    const projectStatus = status === 'succeeded' ? 'ready' : status === 'aborted' ? 'ready' : 'error';
-    const updatedProj = dbStore.updateProject(run.projectId, {
-      status: projectStatus,
-      hasWorkspace: true,
-    });
+      dbStore.finishAgentRun(run.runId, status, error);
 
-    // Remove from activeRuns AFTER DB persistence so any client fetching GET /api/projects/:id sees the final message cleanly
+      const projectStatus = status === 'succeeded' ? 'ready' : status === 'aborted' ? 'ready' : 'error';
+      updatedProj = dbStore.updateProject(run.projectId, {
+        status: projectStatus,
+        ...(workspaceStillExists ? { workspaceId: run.workspaceId } : {}),
+      });
+    }
+
     this.activeRuns.delete(run.projectId);
+    if (this.workspaceActiveProject.get(run.workspaceId) === run.projectId) {
+      this.workspaceActiveProject.delete(run.workspaceId);
+    }
 
+    const wsRow = dbStore.getWorkspace(run.workspaceId);
     const updatedDto = updatedProj
       ? {
-          ...toProjectDTO(updatedProj, Boolean(previewUrl)),
+          ...toProjectDTO(updatedProj, Boolean(previewUrl), wsRow?.name),
           activeStep: null,
           lastActivityAt: null,
         }
@@ -768,7 +1063,7 @@ class PiAgentManager {
       });
     }
 
-    if (previewUrl) {
+    if (previewUrl && projectStillExists) {
       eventBus.emit(run.projectId, {
         type: 'preview_ready',
         projectId: run.projectId,
@@ -776,13 +1071,15 @@ class PiAgentManager {
       });
     }
 
-    eventBus.emit(run.projectId, {
-      type: 'agent_done',
-      runId: run.runId,
-      message: savedMsg,
-      status,
-      error,
-    });
+    if (savedMsg) {
+      eventBus.emit(run.projectId, {
+        type: 'agent_done',
+        runId: run.runId,
+        message: savedMsg,
+        status,
+        error,
+      });
+    }
 
     if (updatedDto) {
       eventBus.emitUser(run.owner, {
@@ -791,6 +1088,12 @@ class PiAgentManager {
         status,
         project: updatedDto,
       });
+    }
+
+    if (wsRow) {
+      this.emitWorkspaceUpdate(run.owner, run.workspaceId, Boolean(previewUrl));
+      // Automatically launch next queued build on the same workspace (if any)
+      this.drainWorkspaceQueue(run.workspaceId);
     }
   }
 }

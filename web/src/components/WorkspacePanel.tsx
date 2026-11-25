@@ -12,25 +12,29 @@ import {
   Loader2,
   Puzzle,
   Table2,
+  FolderGit2,
+  Clock,
 } from 'lucide-react';
-import type { AgentPresetSummary, FileTreeNode, ProjectDTO, TableInfoDTO } from '@atoms/shared';
+import type { AgentPresetSummary, FileTreeNode, TableInfoDTO, WorkspaceDTO } from '@atoms/shared';
 import { api } from '../api';
 import { CodeEditorIDE } from './CodeEditorIDE';
 
+export type WorkspaceTabKey = 'preview' | 'code' | 'database' | 'logs';
+
 interface WorkspacePanelProps {
-  project: ProjectDTO;
+  workspace: WorkspaceDTO;
   previewRevision: number;
   isBuilding: boolean;
+  requestedTab?: { tab: WorkspaceTabKey; nonce: number } | null;
 }
 
-type TabKey = 'preview' | 'code' | 'database' | 'logs';
-
 export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
-  project,
+  workspace,
   previewRevision,
   isBuilding,
+  requestedTab,
 }) => {
-  const [tab, setTab] = useState<TabKey>('preview');
+  const [tab, setTab] = useState<WorkspaceTabKey>(requestedTab?.tab || 'preview');
   const [iframeNonce, setIframeNonce] = useState(0);
   const [copied, setCopied] = useState(false);
   const [restarting, setRestarting] = useState(false);
@@ -54,34 +58,41 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
     tableCount: number;
   } | null>(null);
 
-  const shareUrl = project.previewUrl ? `${window.location.origin}${project.previewUrl}` : '';
+  const shareUrl = `${window.location.origin}${workspace.previewUrl}`;
+  const workspaceBusy = Boolean(workspace.activeBuildProjectId) || isBuilding;
+
+  useEffect(() => {
+    if (requestedTab) {
+      setTab(requestedTab.tab);
+    }
+  }, [requestedTab]);
 
   const loadFiles = useCallback(async () => {
     try {
-      const res = await api.listFiles(project.id);
+      const res = await api.listFiles(workspace.id);
       setFiles(res.files);
     } catch {
       // ignore
     }
-  }, [project.id]);
+  }, [workspace.id]);
 
   const loadTables = useCallback(async () => {
     try {
-      const res = await api.getTables(project.id);
+      const res = await api.getTables(workspace.id);
       setTablesInfo(res);
     } catch {
       // ignore
     }
-  }, [project.id]);
+  }, [workspace.id]);
 
   const loadLogs = useCallback(async () => {
     try {
-      const res = await api.getLogs(project.id);
+      const res = await api.getLogs(workspace.id);
       setLogsInfo(res);
     } catch {
       // ignore
     }
-  }, [project.id]);
+  }, [workspace.id]);
 
   useEffect(() => {
     setSelectedTable(null);
@@ -90,7 +101,7 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
     void loadFiles();
     void loadTables();
     void loadLogs();
-  }, [project.id, previewRevision, loadFiles, loadTables, loadLogs]);
+  }, [workspace.id, previewRevision, loadFiles, loadTables, loadLogs]);
 
   useEffect(() => {
     if (tab === 'code') void loadFiles();
@@ -102,7 +113,7 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
     setSelectedTable(logicalName);
     setLoadingRows(true);
     try {
-      const res = await api.getTableRows(project.id, logicalName);
+      const res = await api.getTableRows(workspace.id, logicalName);
       setTableRows(res.rows);
     } catch {
       setTableRows([]);
@@ -112,7 +123,6 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
   };
 
   const handleCopyShare = async () => {
-    if (!shareUrl) return;
     try {
       await navigator.clipboard.writeText(shareUrl);
       setCopied(true);
@@ -125,7 +135,7 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
   const handleRestart = async () => {
     setRestarting(true);
     try {
-      await api.restartPreview(project.id);
+      await api.restartPreview(workspace.id);
       setIframeNonce((n) => n + 1);
       await Promise.all([loadLogs(), loadTables(), loadFiles()]);
     } catch (err) {
@@ -194,7 +204,7 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
         <div className="flex items-center gap-1.5">
           <button
             type="button"
-            disabled={restarting || isBuilding}
+            disabled={restarting || workspaceBusy}
             onClick={() => void handleRestart()}
             title="重新编译并重启应用预览"
             className="p-1.5 rounded-lg text-slate-500 hover:text-slate-800 hover:bg-slate-100 disabled:opacity-40 transition cursor-pointer"
@@ -204,72 +214,94 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
         </div>
       </div>
 
+      {/* Explicit Workspace Context Bar (P0: never confuse which repo is open!) */}
+      <div className="px-3 py-1.5 bg-slate-900 text-slate-200 border-b border-slate-800 flex items-center justify-between gap-2 text-[11px] shrink-0">
+        <div className="flex items-center gap-2 min-w-0">
+          <FolderGit2 className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+          <span className="font-medium text-white truncate">{workspace.name}</span>
+          <span className="font-mono text-[10px] text-slate-400 shrink-0">{workspace.id}</span>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          {workspace.activeBuildProjectId && (
+            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
+              <Loader2 className="w-2.5 h-2.5 animate-spin" />
+              <span className="truncate max-w-[140px]">
+                构建中: {workspace.activeBuildTitle || workspace.activeBuildProjectId}
+              </span>
+            </span>
+          )}
+          {workspace.queuedProjectIds && workspace.queuedProjectIds.length > 0 && (
+            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30">
+              <Clock className="w-2.5 h-2.5" />
+              排队 {workspace.queuedProjectIds.length}
+            </span>
+          )}
+        </div>
+      </div>
+
       {/* Preview Tab */}
       {tab === 'preview' && (
         <div className="flex-1 flex flex-col min-h-0">
-          {project.previewUrl && (
-            <div className="px-3 py-2 bg-slate-100/80 border-b border-slate-200 flex items-center gap-2">
-              <div className="flex-1 bg-white border border-slate-200 rounded-lg px-2.5 py-1 text-xs text-slate-600 font-mono truncate">
-                {shareUrl}
-              </div>
-              <button
-                type="button"
-                onClick={() => setIframeNonce((n) => n + 1)}
-                title="刷新预览"
-                className="p-1.5 rounded-lg bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 cursor-pointer"
-              >
-                <RefreshCw className="w-3.5 h-3.5" />
-              </button>
-              <button
-                type="button"
-                onClick={() => void handleCopyShare()}
-                title="复制免登录分享链接"
-                className="px-2.5 py-1.5 rounded-lg bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 text-xs flex items-center gap-1 cursor-pointer"
-              >
-                {copied ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
-                {copied ? '已复制' : '分享'}
-              </button>
-              <a
-                href={project.previewUrl}
-                target="_blank"
-                rel="noreferrer"
-                title="在新标签页打开"
-                className="p-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white"
-              >
-                <ExternalLink className="w-3.5 h-3.5" />
-              </a>
+          <div className="px-3 py-2 bg-slate-100/80 border-b border-slate-200 flex items-center gap-2">
+            <div className="flex-1 bg-white border border-slate-200 rounded-lg px-2.5 py-1 text-xs text-slate-600 font-mono truncate">
+              {shareUrl}
             </div>
-          )}
+            <button
+              type="button"
+              onClick={() => setIframeNonce((n) => n + 1)}
+              title="刷新预览"
+              className="p-1.5 rounded-lg bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 cursor-pointer"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleCopyShare()}
+              title="复制免登录分享链接"
+              className="px-2.5 py-1.5 rounded-lg bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 text-xs flex items-center gap-1 cursor-pointer"
+            >
+              {copied ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+              {copied ? '已复制' : '分享'}
+            </button>
+            <a
+              href={workspace.previewUrl}
+              target="_blank"
+              rel="noreferrer"
+              title="在新标签页打开"
+              className="p-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white"
+            >
+              <ExternalLink className="w-3.5 h-3.5" />
+            </a>
+          </div>
 
           <div className="flex-1 relative bg-white min-h-0">
-            {isBuilding ? (
+            {workspaceBusy ? (
               <div className="h-full flex flex-col items-center justify-center p-8 text-center">
                 <Loader2 className="w-8 h-8 text-indigo-600 animate-spin mb-3" />
-                <div className="text-sm font-medium text-slate-800">云端 Coding Agent 正在构建你的全栈应用...</div>
+                <div className="text-sm font-medium text-slate-800">
+                  云端 Coding Agent 正在更新代码仓库「{workspace.name}」...
+                </div>
                 <p className="mt-1 text-xs text-slate-500">
-                  已挂载 SQLite 隔离代理插件（Skill + MCP），完成后自动启动预览
+                  已挂载 SQLite 隔离代理插件（Skill + MCP），完成后自动重启预览
                 </p>
               </div>
-            ) : project.previewUrl ? (
+            ) : (
               <iframe
-                key={`${project.id}-${previewRevision}-${iframeNonce}`}
-                src={`${project.previewUrl}?_r=${previewRevision}_${iframeNonce}`}
-                title="Atoms App Preview"
+                key={`${workspace.id}-${previewRevision}-${iframeNonce}`}
+                src={`${workspace.previewUrl}?_r=${previewRevision}_${iframeNonce}`}
+                title={`Preview ${workspace.name}`}
                 className="w-full h-full border-0"
               />
-            ) : (
-              <div className="h-full flex items-center justify-center text-xs text-slate-400">
-                构建完成后将在此处展示实时可交互预览
-              </div>
             )}
           </div>
         </div>
       )}
 
-      {/* VS Code (Monaco + Server LSP) Tab */}
+      {/* VS Code (Monaco + Server LSP) Tab — strictly keyed by workspace.id */}
       {tab === 'code' && (
         <CodeEditorIDE
-          projectId={project.id}
+          key={workspace.id}
+          workspaceId={workspace.id}
           files={files}
           onRefreshFiles={loadFiles}
           onRebuildPreview={handleRestart}
@@ -296,7 +328,7 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
 
             <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
               <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-600 font-mono">
-                隔离前缀: {tablesInfo?.prefix || project.tablePrefix}
+                隔离前缀: {tablesInfo?.prefix || workspace.tablePrefix}
               </span>
               {tablesInfo?.preset?.plugins.map((pl) => (
                 <span
@@ -314,8 +346,9 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
           <div className="flex-1 overflow-y-auto p-3 space-y-3">
             {!tablesInfo || tablesInfo.tables.length === 0 ? (
               <div className="bg-white rounded-xl border border-slate-200 p-6 text-center text-xs text-slate-500">
-                当前命名空间尚未建表。Agent 构建时会自动通过 <code className="font-mono">atoms_db</code> 代理建表，所有物理表名均自动带有用户前缀{' '}
-                <code className="font-mono text-indigo-700">{project.tablePrefix}</code>。
+                仓库「{workspace.name}」尚未建表。Agent 构建时会自动通过{' '}
+                <code className="font-mono">atoms_db</code> 代理建表，所有物理表名均自动带有隔离前缀{' '}
+                <code className="font-mono text-indigo-700">{workspace.tablePrefix}</code>。
               </div>
             ) : (
               tablesInfo.tables.map((tbl) => {

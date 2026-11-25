@@ -100,7 +100,7 @@ export class WorkspaceLspClient {
   private disposed = false;
 
   constructor(
-    private projectId: string,
+    private workspaceId: string,
     private onStatus: (status: LspStatus) => void,
     private onDiagnostics: (relPath: string, diagnostics: LspDiagnostic[]) => void,
   ) {}
@@ -109,7 +109,7 @@ export class WorkspaceLspClient {
     if (this.disposed) return;
     this.onStatus('connecting');
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${proto}//${window.location.host}/api/projects/${encodeURIComponent(this.projectId)}/lsp`;
+    const url = `${proto}//${window.location.host}/api/workspaces/${encodeURIComponent(this.workspaceId)}/lsp`;
     const ws = new WebSocket(url);
     this.ws = ws;
 

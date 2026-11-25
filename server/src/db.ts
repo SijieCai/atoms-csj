@@ -1,6 +1,13 @@
 import crypto from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import type { MessageDTO, MessageMetadata, MessageRole, ProjectDTO, ProjectStatus } from '@atoms/shared';
+import type {
+  MessageDTO,
+  MessageMetadata,
+  MessageRole,
+  ProjectDTO,
+  ProjectStatus,
+  WorkspaceDTO,
+} from '@atoms/shared';
 import { config, ensureDataDirs } from './config.js';
 import { buildTablePrefix } from './db-proxy.js';
 
@@ -11,11 +18,24 @@ db.exec('PRAGMA journal_mode = WAL;');
 db.exec('PRAGMA foreign_keys = ON;');
 
 db.exec(`
+  CREATE TABLE IF NOT EXISTS workspaces (
+    id TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    name TEXT NOT NULL,
+    preset_id TEXT NOT NULL DEFAULT 'fullstack-web',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_workspaces_owner_updated
+    ON workspaces (owner, updated_at DESC);
+
   CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
     owner TEXT NOT NULL,
     title TEXT NOT NULL,
     preset_id TEXT NOT NULL DEFAULT 'fullstack-web',
+    workspace_id TEXT REFERENCES workspaces(id) ON DELETE SET NULL,
     status TEXT NOT NULL DEFAULT 'chatting',
     has_workspace INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
@@ -53,10 +73,48 @@ db.exec(`
     ON agent_runs (project_id, started_at DESC);
 `);
 
-// Safe migration for existing platform.db created before preset_id was added
+// Safe migrations for existing platform.db
 const projCols = db.prepare(`PRAGMA table_info("projects")`).all() as Array<{ name: string }>;
 if (!projCols.some((c) => c.name === 'preset_id')) {
   db.exec(`ALTER TABLE projects ADD COLUMN preset_id TEXT NOT NULL DEFAULT 'fullstack-web'`);
+}
+if (!projCols.some((c) => c.name === 'workspace_id')) {
+  db.exec(`ALTER TABLE projects ADD COLUMN workspace_id TEXT REFERENCES workspaces(id) ON DELETE SET NULL`);
+}
+db.exec(`CREATE INDEX IF NOT EXISTS idx_projects_workspace ON projects (workspace_id)`);
+
+// Smooth lossless migration: promote legacy projects with has_workspace=1 to first-class workspaces
+// Reusing the original project ID preserves disk directories, SQLite table prefixes, and /preview/<id>/ links.
+const legacyWithWs = db
+  .prepare(`
+    SELECT id, owner, title, preset_id, created_at, updated_at
+    FROM projects
+    WHERE has_workspace = 1 AND workspace_id IS NULL
+  `)
+  .all() as unknown as Array<{
+  id: string;
+  owner: string;
+  title: string;
+  preset_id: string;
+  created_at: number;
+  updated_at: number;
+}>;
+
+for (const row of legacyWithWs) {
+  db.prepare(`
+    INSERT OR IGNORE INTO workspaces (id, owner, name, preset_id, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(row.id, row.owner, row.title, row.preset_id || 'fullstack-web', row.created_at, row.updated_at);
+  db.prepare(`UPDATE projects SET workspace_id = ? WHERE id = ?`).run(row.id, row.id);
+}
+
+export interface WorkspaceRow {
+  id: string;
+  owner: string;
+  name: string;
+  preset_id: string;
+  created_at: number;
+  updated_at: number;
 }
 
 export interface ProjectRow {
@@ -64,6 +122,7 @@ export interface ProjectRow {
   owner: string;
   title: string;
   preset_id: string;
+  workspace_id: string | null;
   status: ProjectStatus;
   has_workspace: number;
   created_at: number;
@@ -84,18 +143,50 @@ export function generateId(prefix = ''): string {
   return prefix ? `${prefix}_${rand}` : rand;
 }
 
-export function toProjectDTO(row: ProjectRow, previewRunning = false): ProjectDTO {
-  const hasWorkspace = Boolean(row.has_workspace);
+export function toWorkspaceDTO(
+  row: WorkspaceRow,
+  previewRunning = false,
+  buildState?: {
+    activeBuildProjectId?: string | null;
+    activeBuildTitle?: string | null;
+    queuedProjectIds?: string[];
+  },
+): WorkspaceDTO {
+  return {
+    id: row.id,
+    owner: row.owner,
+    name: row.name,
+    presetId: row.preset_id || 'fullstack-web',
+    tablePrefix: buildTablePrefix(row.owner, row.id),
+    previewUrl: `/preview/${row.id}/`,
+    previewRunning,
+    activeBuildProjectId: buildState?.activeBuildProjectId ?? null,
+    activeBuildTitle: buildState?.activeBuildTitle ?? null,
+    queuedProjectIds: buildState?.queuedProjectIds ?? [],
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+export function toProjectDTO(
+  row: ProjectRow,
+  previewRunning = false,
+  workspaceName?: string | null,
+): ProjectDTO {
+  const workspaceId = row.workspace_id || null;
+  const hasWorkspace = Boolean(workspaceId);
   return {
     id: row.id,
     owner: row.owner,
     title: row.title,
     presetId: row.preset_id || 'fullstack-web',
-    tablePrefix: buildTablePrefix(row.owner, row.id),
+    workspaceId,
+    workspaceName: workspaceName ?? null,
+    tablePrefix: buildTablePrefix(row.owner, workspaceId || row.id),
     status: row.status,
     hasWorkspace,
-    previewUrl: hasWorkspace ? `/preview/${row.id}/` : null,
-    previewRunning,
+    previewUrl: workspaceId ? `/preview/${workspaceId}/` : null,
+    previewRunning: hasWorkspace ? previewRunning : false,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -121,64 +212,158 @@ function toMessageDTO(row: MessageRow): MessageDTO {
 }
 
 export const dbStore = {
-  createProject(owner: string, title: string, presetId = 'fullstack-web'): ProjectRow {
+  // ---- Workspaces ----
+  createWorkspace(owner: string, name: string, presetId = 'fullstack-web', explicitId?: string): WorkspaceRow {
+    const id = explicitId || generateId('ws');
+    const now = Date.now();
+    db.prepare(`
+      INSERT INTO workspaces (id, owner, name, preset_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(id, owner, name, presetId, now, now);
+    return {
+      id,
+      owner,
+      name,
+      preset_id: presetId,
+      created_at: now,
+      updated_at: now,
+    };
+  },
+
+  listWorkspaces(owner: string): WorkspaceRow[] {
+    return db
+      .prepare(`
+        SELECT id, owner, name, preset_id, created_at, updated_at
+        FROM workspaces
+        WHERE owner = ?
+        ORDER BY updated_at DESC
+      `)
+      .all(owner) as unknown as WorkspaceRow[];
+  },
+
+  getWorkspace(id: string): WorkspaceRow | undefined {
+    return db
+      .prepare(`
+        SELECT id, owner, name, preset_id, created_at, updated_at
+        FROM workspaces
+        WHERE id = ?
+      `)
+      .get(id) as unknown as WorkspaceRow | undefined;
+  },
+
+  updateWorkspace(id: string, patch: { name?: string }): WorkspaceRow | undefined {
+    const current = this.getWorkspace(id);
+    if (!current) return undefined;
+    const name = patch.name ?? current.name;
+    const now = Date.now();
+    db.prepare(`UPDATE workspaces SET name = ?, updated_at = ? WHERE id = ?`).run(name, now, id);
+    return { ...current, name, updated_at: now };
+  },
+
+  touchWorkspace(id: string): void {
+    db.prepare(`UPDATE workspaces SET updated_at = ? WHERE id = ?`).run(Date.now(), id);
+  },
+
+  deleteWorkspace(id: string): void {
+    db.prepare(`UPDATE projects SET workspace_id = NULL, has_workspace = 0 WHERE workspace_id = ?`).run(id);
+    db.prepare(`DELETE FROM workspaces WHERE id = ?`).run(id);
+  },
+
+  // ---- Projects (Conversation Threads) ----
+  createProject(
+    owner: string,
+    title: string,
+    presetId = 'fullstack-web',
+    workspaceId: string | null = null,
+  ): ProjectRow {
     const id = generateId('proj');
     const now = Date.now();
-    const stmt = db.prepare(`
-      INSERT INTO projects (id, owner, title, preset_id, status, has_workspace, created_at, updated_at)
-      VALUES (?, ?, ?, ?, 'chatting', 0, ?, ?)
-    `);
-    stmt.run(id, owner, title, presetId, now, now);
+    const hasWs = workspaceId ? 1 : 0;
+    db.prepare(`
+      INSERT INTO projects (id, owner, title, preset_id, workspace_id, status, has_workspace, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, 'chatting', ?, ?, ?)
+    `).run(id, owner, title, presetId, workspaceId, hasWs, now, now);
+    if (workspaceId) {
+      this.touchWorkspace(workspaceId);
+    }
     return {
       id,
       owner,
       title,
       preset_id: presetId,
+      workspace_id: workspaceId,
       status: 'chatting',
-      has_workspace: 0,
+      has_workspace: hasWs,
       created_at: now,
       updated_at: now,
     };
   },
 
   listProjects(owner: string): ProjectRow[] {
-    const stmt = db.prepare(`
-      SELECT id, owner, title, preset_id, status, has_workspace, created_at, updated_at
-      FROM projects
-      WHERE owner = ?
-      ORDER BY updated_at DESC
-    `);
-    return stmt.all(owner) as unknown as ProjectRow[];
+    return db
+      .prepare(`
+        SELECT id, owner, title, preset_id, workspace_id, status, has_workspace, created_at, updated_at
+        FROM projects
+        WHERE owner = ?
+        ORDER BY updated_at DESC
+      `)
+      .all(owner) as unknown as ProjectRow[];
+  },
+
+  listProjectsByWorkspace(workspaceId: string): ProjectRow[] {
+    return db
+      .prepare(`
+        SELECT id, owner, title, preset_id, workspace_id, status, has_workspace, created_at, updated_at
+        FROM projects
+        WHERE workspace_id = ?
+        ORDER BY updated_at DESC
+      `)
+      .all(workspaceId) as unknown as ProjectRow[];
   },
 
   getProject(id: string): ProjectRow | undefined {
-    const stmt = db.prepare(`
-      SELECT id, owner, title, preset_id, status, has_workspace, created_at, updated_at
-      FROM projects
-      WHERE id = ?
-    `);
-    return stmt.get(id) as unknown as ProjectRow | undefined;
+    return db
+      .prepare(`
+        SELECT id, owner, title, preset_id, workspace_id, status, has_workspace, created_at, updated_at
+        FROM projects
+        WHERE id = ?
+      `)
+      .get(id) as unknown as ProjectRow | undefined;
   },
 
   updateProject(
     id: string,
-    patch: { title?: string; status?: ProjectStatus; hasWorkspace?: boolean },
+    patch: { title?: string; status?: ProjectStatus; hasWorkspace?: boolean; workspaceId?: string | null },
   ): ProjectRow | undefined {
     const current = this.getProject(id);
     if (!current) return undefined;
     const title = patch.title ?? current.title;
     const status = patch.status ?? current.status;
-    const hasWorkspace = patch.hasWorkspace === undefined ? current.has_workspace : patch.hasWorkspace ? 1 : 0;
+    const workspaceId = patch.workspaceId === undefined ? current.workspace_id : patch.workspaceId;
+    const hasWorkspace =
+      patch.workspaceId !== undefined
+        ? workspaceId
+          ? 1
+          : 0
+        : patch.hasWorkspace === undefined
+          ? current.has_workspace
+          : patch.hasWorkspace
+            ? 1
+            : 0;
     const now = Date.now();
     db.prepare(`
       UPDATE projects
-      SET title = ?, status = ?, has_workspace = ?, updated_at = ?
+      SET title = ?, status = ?, workspace_id = ?, has_workspace = ?, updated_at = ?
       WHERE id = ?
-    `).run(title, status, hasWorkspace, now, id);
+    `).run(title, status, workspaceId, hasWorkspace, now, id);
+    if (workspaceId) {
+      this.touchWorkspace(workspaceId);
+    }
     return {
       ...current,
       title,
       status,
+      workspace_id: workspaceId,
       has_workspace: hasWorkspace,
       updated_at: now,
     };
@@ -188,6 +373,7 @@ export const dbStore = {
     db.prepare('DELETE FROM projects WHERE id = ?').run(id);
   },
 
+  // ---- Messages ----
   addMessage(
     projectId: string,
     role: MessageRole,
@@ -238,6 +424,7 @@ export const dbStore = {
     return rows.map(toMessageDTO);
   },
 
+  // ---- Agent Runs ----
   createAgentRun(projectId: string, prompt: string): string {
     const id = generateId('run');
     const now = Date.now();
@@ -266,14 +453,14 @@ export const dbStore = {
 
     const stale = db
       .prepare(`
-        SELECT id, owner, title, preset_id, status, has_workspace, created_at, updated_at
+        SELECT id, owner, title, preset_id, workspace_id, status, has_workspace, created_at, updated_at
         FROM projects
-        WHERE status = 'building'
+        WHERE status IN ('building', 'queued')
       `)
       .all() as unknown as ProjectRow[];
 
     for (const row of stale) {
-      const nextStatus: ProjectStatus = row.has_workspace ? 'ready' : 'error';
+      const nextStatus: ProjectStatus = row.workspace_id || row.has_workspace ? 'ready' : 'error';
       db.prepare(`UPDATE projects SET status = ?, updated_at = ? WHERE id = ?`).run(nextStatus, now, row.id);
       this.addMessage(
         row.id,

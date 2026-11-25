@@ -5,18 +5,20 @@ import type {
   ProjectDTO,
   SSEEvent,
   UserGlobalSSEEvent,
+  WorkspaceDTO,
 } from '@atoms/shared';
 import { api } from './api';
 import { LoginPage } from './components/LoginPage';
 import { Sidebar } from './components/Sidebar';
 import { ChatPanel, type LiveStreamState } from './components/ChatPanel';
-import { WorkspacePanel } from './components/WorkspacePanel';
+import { WorkspacePanel, type WorkspaceTabKey } from './components/WorkspacePanel';
 
 function snapshotToLiveStream(snapshot: ActiveRunSnapshot | null | undefined): LiveStreamState | null {
   if (!snapshot) return null;
   return {
     messageId: snapshot.messageId,
     mode: snapshot.mode,
+    queued: snapshot.queued,
     text: snapshot.text,
     thinking: snapshot.thinking,
     steps: snapshot.steps.map((s) => ({ ...s })),
@@ -32,6 +34,7 @@ export default function App() {
   const [username, setUsername] = useState<string | null>(null);
   const [glmConfigured, setGlmConfigured] = useState(true);
 
+  const [workspaces, setWorkspaces] = useState<WorkspaceDTO[]>([]);
   const [projects, setProjects] = useState<ProjectDTO[]>([]);
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [messages, setMessages] = useState<MessageDTO[]>([]);
@@ -39,6 +42,7 @@ export default function App() {
   const [suggestBuild, setSuggestBuild] = useState(false);
   const [liveStream, setLiveStream] = useState<LiveStreamState | null>(null);
   const [previewRevision, setPreviewRevision] = useState(0);
+  const [requestedTab, setRequestedTab] = useState<{ tab: WorkspaceTabKey; nonce: number } | null>(null);
   const [unreadCompletions, setUnreadCompletions] = useState<
     Record<string, 'succeeded' | 'aborted' | 'failed'>
   >({});
@@ -54,11 +58,15 @@ export default function App() {
   liveStreamRef.current = liveStream;
 
   const activeProject = projects.find((p) => p.id === activeProjectId) || null;
+  const activeWorkspace = activeProject?.workspaceId
+    ? workspaces.find((w) => w.id === activeProject.workspaceId) || null
+    : null;
 
-  const refreshProjects = useCallback(async () => {
-    const res = await api.listProjects();
-    setProjects(res.projects);
-    return res.projects;
+  const refreshAll = useCallback(async () => {
+    const [wsRes, projRes] = await Promise.all([api.listWorkspaces(), api.listProjects()]);
+    setWorkspaces(wsRes.workspaces);
+    setProjects(projRes.projects);
+    return { workspaces: wsRes.workspaces, projects: projRes.projects };
   }, []);
 
   useEffect(() => {
@@ -67,7 +75,7 @@ export default function App() {
       .then((res) => {
         setUsername(res.user.username);
         setGlmConfigured(res.glmConfigured);
-        return refreshProjects();
+        return refreshAll();
       })
       .catch(() => {
         setUsername(null);
@@ -75,9 +83,9 @@ export default function App() {
       .finally(() => {
         setAuthChecked(true);
       });
-  }, [refreshProjects]);
+  }, [refreshAll]);
 
-  // Persistent user-level SSE for real-time sidebar sync across ALL projects
+  // Persistent user-level SSE for real-time sidebar sync across ALL workspaces & threads
   useEffect(() => {
     if (!username) {
       if (userEventSourceRef.current) {
@@ -99,6 +107,18 @@ export default function App() {
       }
 
       switch (parsed.type) {
+        case 'workspace_updated':
+          setWorkspaces((prev) => {
+            const exists = prev.some((w) => w.id === parsed.workspace.id);
+            if (!exists) return [parsed.workspace, ...prev];
+            return prev.map((w) => (w.id === parsed.workspace.id ? parsed.workspace : w));
+          });
+          break;
+
+        case 'workspace_deleted':
+          setWorkspaces((prev) => prev.filter((w) => w.id !== parsed.workspaceId));
+          break;
+
         case 'project_updated':
           setProjects((prev) => {
             const exists = prev.some((p) => p.id === parsed.project.id);
@@ -199,14 +219,12 @@ export default function App() {
               lastStreamSeqRef.current = Math.max(lastStreamSeqRef.current, parsed.activeRun.seq);
               setLiveStream((prev) => {
                 if (!snap) return prev;
-                // Only replace if no current stream, different messageId, or snapshot is newer
                 if (!prev || prev.messageId !== snap.messageId || (snap.seq ?? 0) >= (prev.seq ?? 0)) {
                   return snap;
                 }
                 return prev;
               });
             } else if (liveStreamRef.current) {
-              // Run finished while reconnecting — fetch latest persisted messages so final output isn't missed
               setLiveStream(null);
               void api
                 .getProject(projectId)
@@ -225,7 +243,6 @@ export default function App() {
             return;
           }
 
-          // Strict per-project seq deduplication so snapshot + live deltas never double-append
           if (typeof parsed.seq === 'number') {
             if (parsed.seq <= lastStreamSeqRef.current) {
               return;
@@ -297,12 +314,30 @@ export default function App() {
               });
               break;
 
+            case 'agent_queued':
+              setIsBuilding(true);
+              setSuggestBuild(false);
+              setLiveStream({
+                messageId: parsed.messageId,
+                mode: 'build',
+                queued: true,
+                text: '',
+                thinking: '',
+                steps: [],
+                statusText: `排队中 (#${parsed.position})：等待同仓库「${parsed.blockingTitle || '前序对话'}」完成当前修改...`,
+                startedAt: nowTs,
+                lastActivityAt: nowTs,
+                seq,
+              });
+              break;
+
             case 'agent_start':
               setIsBuilding(true);
               setSuggestBuild(false);
               setLiveStream({
                 messageId: parsed.messageId,
                 mode: 'build',
+                queued: false,
                 text: '',
                 thinking: '',
                 steps: [],
@@ -320,6 +355,7 @@ export default function App() {
                   return {
                     messageId: parsed.messageId,
                     mode: 'build',
+                    queued: false,
                     text: '',
                     thinking: parsed.delta,
                     steps: [],
@@ -330,6 +366,7 @@ export default function App() {
                 }
                 return {
                   ...prev,
+                  queued: false,
                   thinking: prev.thinking + parsed.delta,
                   statusText: undefined,
                   lastActivityAt: nowTs,
@@ -345,6 +382,7 @@ export default function App() {
                   return {
                     messageId: parsed.messageId,
                     mode: 'build',
+                    queued: false,
                     text: parsed.delta,
                     thinking: '',
                     steps: [],
@@ -355,6 +393,7 @@ export default function App() {
                 }
                 return {
                   ...prev,
+                  queued: false,
                   text: prev.text + parsed.delta,
                   statusText: undefined,
                   lastActivityAt: nowTs,
@@ -368,10 +407,11 @@ export default function App() {
               setLiveStream((prev) => {
                 const base: LiveStreamState =
                   prev && prev.messageId === parsed.messageId
-                    ? prev
+                    ? { ...prev, queued: false }
                     : {
                         messageId: parsed.messageId,
                         mode: 'build',
+                        queued: false,
                         text: '',
                         thinking: '',
                         steps: [],
@@ -458,7 +498,7 @@ export default function App() {
                 const without = prev.filter((m) => m.id !== parsed.message.id);
                 return [...without, parsed.message];
               });
-              void refreshProjects();
+              void refreshAll();
               break;
 
             case 'error':
@@ -469,7 +509,7 @@ export default function App() {
         };
       });
     },
-    [closeStream, refreshProjects],
+    [closeStream, refreshAll],
   );
 
   useEffect(() => {
@@ -507,7 +547,7 @@ export default function App() {
       await connectStream(projectId);
     } catch (err) {
       if (selectSeqRef.current === reqSeq) {
-        alert(err instanceof Error ? err.message : '加载项目失败');
+        alert(err instanceof Error ? err.message : '加载对话失败');
       }
     }
   };
@@ -523,8 +563,44 @@ export default function App() {
     setLiveStream(null);
   };
 
+  const handleNewWorkspace = async () => {
+    const name = window.prompt('输入新代码仓库名称：', '新全栈项目');
+    if (name === null) return;
+    const clean = name.trim() || '新全栈项目';
+    try {
+      const wsRes = await api.createWorkspace(clean);
+      setWorkspaces((prev) =>
+        prev.some((w) => w.id === wsRes.workspace.id) ? prev : [wsRes.workspace, ...prev],
+      );
+      const projRes = await api.createProject(`${clean} - 主对话`, wsRes.workspace.id);
+      setProjects((prev) =>
+        prev.some((p) => p.id === projRes.project.id) ? prev : [projRes.project, ...prev],
+      );
+      setRequestedTab({ tab: 'code', nonce: Date.now() });
+      await handleSelectProject(projRes.project.id);
+    } catch (err) {
+      alert(err instanceof Error ? err.message : '创建代码仓库失败');
+    }
+  };
+
+  const handleNewThreadInWorkspace = async (workspaceId: string) => {
+    const ws = workspaces.find((w) => w.id === workspaceId);
+    try {
+      const projRes = await api.createProject(
+        ws ? `${ws.name} - 新任务` : '新对话',
+        workspaceId,
+      );
+      setProjects((prev) =>
+        prev.some((p) => p.id === projRes.project.id) ? prev : [projRes.project, ...prev],
+      );
+      await handleSelectProject(projRes.project.id);
+    } catch (err) {
+      alert(err instanceof Error ? err.message : '新建对话失败');
+    }
+  };
+
   const handleDeleteProject = async (projectId: string) => {
-    if (!confirm('确认删除该项目及其所有代码和 SQLite 数据吗？')) return;
+    if (!confirm('确认删除此对话记录吗？（关联的代码仓库与数据表不会被删除）')) return;
     await api.deleteProject(projectId);
     setProjects((prev) => prev.filter((p) => p.id !== projectId));
     if (activeProjectId === projectId) {
@@ -532,10 +608,47 @@ export default function App() {
     }
   };
 
+  const handleDeleteWorkspace = async (workspaceId: string) => {
+    const ws = workspaces.find((w) => w.id === workspaceId);
+    if (
+      !confirm(
+        `确认删除代码仓库「${ws?.name || workspaceId}」及其磁盘代码和 SQLite 数据表吗？（历史对话记录会保留为未绑定对话）`,
+      )
+    ) {
+      return;
+    }
+    await api.deleteWorkspace(workspaceId);
+    setWorkspaces((prev) => prev.filter((w) => w.id !== workspaceId));
+    setProjects((prev) =>
+      prev.map((p) =>
+        p.workspaceId === workspaceId
+          ? { ...p, workspaceId: null, workspaceName: null, hasWorkspace: false, previewUrl: null }
+          : p,
+      ),
+    );
+  };
+
+  const handleBindWorkspace = async (opts: { workspaceId?: string; createNew?: boolean; name?: string }) => {
+    if (!activeProjectId) return;
+    try {
+      const res = await api.bindWorkspace(activeProjectId, opts);
+      setWorkspaces((prev) => {
+        const exists = prev.some((w) => w.id === res.workspace.id);
+        return exists
+          ? prev.map((w) => (w.id === res.workspace.id ? res.workspace : w))
+          : [res.workspace, ...prev];
+      });
+      setProjects((prev) => prev.map((p) => (p.id === res.project.id ? res.project : p)));
+      setRequestedTab({ tab: 'code', nonce: Date.now() });
+    } catch (err) {
+      alert(err instanceof Error ? err.message : '关联代码仓库失败');
+    }
+  };
+
   const handleSend = async (text: string, forceBuild = false) => {
     let targetProjectId = activeProjectId;
     if (!targetProjectId) {
-      const created = await api.createProject(text.slice(0, 20));
+      const created = await api.createProject(text.slice(0, 20), null);
       targetProjectId = created.project.id;
       activeProjectIdRef.current = targetProjectId;
       lastStreamSeqRef.current = 0;
@@ -560,16 +673,6 @@ export default function App() {
     await api.abortAgent(activeProjectId);
   };
 
-  const handleInitWorkspace = async () => {
-    if (!activeProjectId) return;
-    try {
-      const res = await api.initWorkspace(activeProjectId);
-      setProjects((prev) => prev.map((p) => (p.id === res.project.id ? res.project : p)));
-    } catch (err) {
-      alert(err instanceof Error ? err.message : '初始化工作区失败');
-    }
-  };
-
   const handleLogout = async () => {
     selectSeqRef.current++;
     closeStream();
@@ -579,6 +682,7 @@ export default function App() {
     }
     await api.logout();
     setUsername(null);
+    setWorkspaces([]);
     setProjects([]);
     setUnreadCompletions({});
     setActiveProjectId(null);
@@ -599,29 +703,33 @@ export default function App() {
         onSuccess={(u) => {
           setUsername(u);
           void api.me().then((res) => setGlmConfigured(res.glmConfigured));
-          void refreshProjects();
+          void refreshAll();
         }}
       />
     );
   }
 
-  const showWorkspace = Boolean(activeProject && (activeProject.hasWorkspace || isBuilding));
-
   return (
     <div className="h-screen w-screen flex overflow-hidden bg-slate-50">
       <Sidebar
         username={username}
+        workspaces={workspaces}
         projects={projects}
         activeProjectId={activeProjectId}
         unreadCompletions={unreadCompletions}
         onSelectProject={(id) => void handleSelectProject(id)}
         onNewChat={handleNewChat}
+        onNewWorkspace={() => void handleNewWorkspace()}
+        onNewThreadInWorkspace={(wsId) => void handleNewThreadInWorkspace(wsId)}
         onDeleteProject={(id) => void handleDeleteProject(id)}
+        onDeleteWorkspace={(wsId) => void handleDeleteWorkspace(wsId)}
         onLogout={() => void handleLogout()}
       />
 
       <ChatPanel
         project={activeProject}
+        workspace={activeWorkspace}
+        workspaces={workspaces}
         messages={messages}
         liveStream={liveStream}
         isBuilding={isBuilding}
@@ -629,15 +737,22 @@ export default function App() {
         glmConfigured={glmConfigured}
         onSend={handleSend}
         onAbort={handleAbort}
-        onOpenPreview={() => setPreviewRevision((n) => n + 1)}
-        onInitWorkspace={handleInitWorkspace}
+        onOpenPreview={() => {
+          setRequestedTab({ tab: 'preview', nonce: Date.now() });
+          setPreviewRevision((n) => n + 1);
+        }}
+        onOpenVsCode={() => setRequestedTab({ tab: 'code', nonce: Date.now() })}
+        onBindWorkspace={handleBindWorkspace}
       />
 
-      {showWorkspace && activeProject && (
+      {/* P0: Strictly keyed by activeWorkspace.id so switching workspaces never leaks stale editor/tree/LSP state */}
+      {activeWorkspace && (
         <WorkspacePanel
-          project={activeProject}
+          key={activeWorkspace.id}
+          workspace={activeWorkspace}
           previewRevision={previewRevision}
           isBuilding={isBuilding}
+          requestedTab={requestedTab}
         />
       )}
     </div>

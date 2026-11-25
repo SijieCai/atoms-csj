@@ -1,4 +1,4 @@
-export type ProjectStatus = 'chatting' | 'building' | 'ready' | 'error';
+export type ProjectStatus = 'chatting' | 'queued' | 'building' | 'ready' | 'error';
 
 export type MessageRole = 'user' | 'assistant' | 'system';
 
@@ -56,6 +56,7 @@ export interface ActiveRunSnapshot {
   runId?: string;
   messageId: string;
   mode: 'chat' | 'build';
+  queued?: boolean;
   startedAt: number;
   lastActivityAt: number;
   statusText?: string;
@@ -65,11 +66,28 @@ export interface ActiveRunSnapshot {
   seq: number;
 }
 
+export interface WorkspaceDTO {
+  id: string;
+  owner: string;
+  name: string;
+  presetId: string;
+  tablePrefix: string;
+  previewUrl: string;
+  previewRunning: boolean;
+  activeBuildProjectId?: string | null;
+  activeBuildTitle?: string | null;
+  queuedProjectIds?: string[];
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface ProjectDTO {
   id: string;
   owner: string;
   title: string;
   presetId: string;
+  workspaceId: string | null;
+  workspaceName?: string | null;
   tablePrefix: string;
   status: ProjectStatus;
   hasWorkspace: boolean;
@@ -104,6 +122,7 @@ export type SSEEventPayload =
   | { type: 'chat_start'; messageId: string; startedAt?: number }
   | { type: 'chat_delta'; messageId: string; delta: string }
   | { type: 'chat_done'; message: MessageDTO; suggestBuild?: boolean }
+  | { type: 'agent_queued'; messageId: string; workspaceId: string; position: number; blockingProjectId: string; blockingTitle?: string }
   | { type: 'agent_start'; runId: string; messageId: string; startedAt?: number }
   | { type: 'agent_thinking_delta'; messageId: string; delta: string }
   | { type: 'agent_text_delta'; messageId: string; delta: string }
@@ -122,6 +141,8 @@ export type SSEEvent = SSEEventPayload & {
 
 export type UserGlobalSSEEvent =
   | { type: 'user_connected'; username: string }
+  | { type: 'workspace_updated'; workspace: WorkspaceDTO }
+  | { type: 'workspace_deleted'; workspaceId: string }
   | { type: 'project_updated'; project: ProjectDTO }
   | {
       type: 'project_activity';

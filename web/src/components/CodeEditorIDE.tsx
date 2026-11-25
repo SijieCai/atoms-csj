@@ -115,14 +115,14 @@ interface OpenTab {
 }
 
 interface CodeEditorIDEProps {
-  projectId: string;
+  workspaceId: string;
   files: FileTreeNode[];
   onRefreshFiles: () => Promise<void>;
   onRebuildPreview: () => Promise<void>;
 }
 
 export const CodeEditorIDE: React.FC<CodeEditorIDEProps> = ({
-  projectId,
+  workspaceId,
   files,
   onRefreshFiles,
   onRebuildPreview,
@@ -206,7 +206,7 @@ export const CodeEditorIDE: React.FC<CodeEditorIDEProps> = ({
       }
 
       try {
-        const res = await api.readFile(projectId, filePath);
+        const res = await api.readFile(workspaceId, filePath);
         const uri = monaco.Uri.parse(toVirtualUri(filePath));
         const lang = toMonacoLanguage(filePath);
         const old = monaco.editor.getModel(uri);
@@ -254,7 +254,7 @@ export const CodeEditorIDE: React.FC<CodeEditorIDEProps> = ({
         alert(err instanceof Error ? err.message : '打开文件失败');
       }
     },
-    [projectId, applyDiagnosticsToModel],
+    [workspaceId, applyDiagnosticsToModel],
   );
 
   const saveFile = useCallback(
@@ -269,7 +269,7 @@ export const CodeEditorIDE: React.FC<CodeEditorIDEProps> = ({
       const content = model.getValue();
       setSaving(true);
       try {
-        await api.writeFile(projectId, filePath, content);
+        await api.writeFile(workspaceId, filePath, content);
         lspRef.current?.didChange(filePath, content);
         lspRef.current?.didSave(filePath, content);
         setTabs((prev) =>
@@ -283,7 +283,7 @@ export const CodeEditorIDE: React.FC<CodeEditorIDEProps> = ({
         setSaving(false);
       }
     },
-    [projectId],
+    [workspaceId],
   );
 
   const saveAllAndRebuild = async () => {
@@ -311,7 +311,7 @@ export const CodeEditorIDE: React.FC<CodeEditorIDEProps> = ({
     setDiagCounts({ errors: 0, warnings: 0 });
 
     const client = new WorkspaceLspClient(
-      projectId,
+      workspaceId,
       (status) => {
         setLspStatus(status);
         if (status === 'connected') {
@@ -475,7 +475,7 @@ export const CodeEditorIDE: React.FC<CodeEditorIDEProps> = ({
       client.dispose();
       lspRef.current = null;
     };
-  }, [projectId, applyDiagnosticsToModel, openFile, saveFile]);
+  }, [workspaceId, applyDiagnosticsToModel, openFile, saveFile]);
 
   // Auto-open entry file when workspace files load and nothing is open yet
   useEffect(() => {
@@ -524,7 +524,7 @@ export const CodeEditorIDE: React.FC<CodeEditorIDEProps> = ({
     const relPath = window.prompt(label);
     if (!relPath || !relPath.trim()) return;
     try {
-      const created = await api.createEntry(projectId, relPath.trim(), type);
+      const created = await api.createEntry(workspaceId, relPath.trim(), type);
       await onRefreshFiles();
       if (type === 'file') {
         await openFile(created.path);
@@ -537,7 +537,7 @@ export const CodeEditorIDE: React.FC<CodeEditorIDEProps> = ({
   const handleDeleteEntry = async (relPath: string) => {
     if (!confirm(`确认从服务器工作区删除 "${relPath}" 吗？`)) return;
     try {
-      await api.deleteEntry(projectId, relPath);
+      await api.deleteEntry(workspaceId, relPath);
       if (tabs.some((t) => t.path === relPath)) {
         lspRef.current?.didClose(relPath);
         modelsRef.current.get(relPath)?.dispose();

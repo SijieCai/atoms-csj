@@ -10,7 +10,8 @@ import { dbStore } from './db.js';
 import { previewManager } from './preview-manager.js';
 
 const VIRTUAL_ROOT_URI = 'file:///workspace';
-const LSP_PATH_RE = /^\/api\/projects\/([a-zA-Z0-9_-]{3,64})\/lsp(?:\?.*)?$/;
+const WORKSPACE_LSP_RE = /^\/api\/workspaces\/([a-zA-Z0-9_-]{3,64})\/lsp(?:\?.*)?$/;
+const PROJECT_LSP_RE = /^\/api\/projects\/([a-zA-Z0-9_-]{3,64})\/lsp(?:\?.*)?$/;
 
 function parseCookieHeader(cookieHeader: string | undefined): Record<string, string> {
   const out: Record<string, string> = {};
@@ -131,12 +132,12 @@ class LspManager {
   attach(httpServer: http.Server): void {
     httpServer.on('upgrade', (req, socket, head) => {
       const urlStr = req.url || '';
-      const match = urlStr.match(LSP_PATH_RE);
-      if (!match) {
+      const wsMatch = urlStr.match(WORKSPACE_LSP_RE);
+      const projMatch = wsMatch ? null : urlStr.match(PROJECT_LSP_RE);
+      if (!wsMatch && !projMatch) {
         return;
       }
 
-      const projectId = match[1];
       const cookies = parseCookieHeader(req.headers.cookie);
       const username = verifySessionToken(cookies.atoms_session);
       if (!username) {
@@ -145,21 +146,33 @@ class LspManager {
         return;
       }
 
-      const project = dbStore.getProject(projectId);
-      if (!project || project.owner !== username) {
-        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
-        socket.destroy();
-        return;
+      let workspaceId: string | null = null;
+      if (wsMatch) {
+        const wsRow = dbStore.getWorkspace(wsMatch[1]);
+        if (!wsRow || wsRow.owner !== username) {
+          socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+        workspaceId = wsRow.id;
+      } else if (projMatch) {
+        const project = dbStore.getProject(projMatch[1]);
+        if (!project || project.owner !== username) {
+          socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+        workspaceId = project.workspace_id || (project.has_workspace ? project.id : null);
       }
 
-      if (!previewManager.hasWorkspace(projectId)) {
+      if (!workspaceId || !previewManager.hasWorkspace(workspaceId)) {
         socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
         socket.destroy();
         return;
       }
 
       this.wss.handleUpgrade(req, socket, head, (ws) => {
-        this.startSession(projectId, ws);
+        this.startSession(workspaceId!, ws);
       });
     });
   }

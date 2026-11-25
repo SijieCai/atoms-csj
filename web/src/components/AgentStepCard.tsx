@@ -18,6 +18,7 @@ interface AgentStepCardProps {
   steps?: AgentToolStep[];
   statusText?: string;
   isRunning?: boolean;
+  isQueued?: boolean;
   startedAt?: number;
   lastActivityAt?: number;
 }
@@ -55,6 +56,7 @@ export const AgentStepCard: React.FC<AgentStepCardProps> = ({
   steps = [],
   statusText,
   isRunning,
+  isQueued,
   startedAt,
   lastActivityAt,
 }) => {
@@ -144,15 +146,25 @@ export const AgentStepCard: React.FC<AgentStepCardProps> = ({
       )}
 
       {(statusText || isRunning) && (
-        <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-indigo-700 bg-indigo-50 border border-indigo-100 rounded-lg px-3 py-1.5">
+        <div
+          className={`flex flex-wrap items-center justify-between gap-2 text-xs rounded-lg px-3 py-1.5 border ${
+            isQueued
+              ? 'text-amber-800 bg-amber-50 border-amber-200'
+              : 'text-indigo-700 bg-indigo-50 border-indigo-100'
+          }`}
+        >
           <div className="flex items-center gap-2 min-w-0">
             {isRunning && <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />}
             <span className="truncate">{statusText || 'Pi Coding Agent 正在隔离工作区开发与编译...'}</span>
           </div>
           {isRunning && (startedAt || lastActivityAt) && (
-            <div className="flex items-center gap-2 text-[11px] text-indigo-600/80 shrink-0 font-mono">
-              {startedAt && <span>已耗时 {formatDuration(elapsedMs)}</span>}
-              {lastActivityAt && (
+            <div
+              className={`flex items-center gap-2 text-[11px] shrink-0 font-mono ${
+                isQueued ? 'text-amber-700/80' : 'text-indigo-600/80'
+              }`}
+            >
+              {startedAt && <span>{isQueued ? '已等待' : '已耗时'} {formatDuration(elapsedMs)}</span>}
+              {!isQueued && lastActivityAt && (
                 <span className="inline-flex items-center gap-1">
                   <span
                     className={`w-1.5 h-1.5 rounded-full ${

@@ -5,6 +5,7 @@ import type {
   MessageDTO,
   ProjectDTO,
   TableInfoDTO,
+  WorkspaceDTO,
 } from '@atoms/shared';
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -46,14 +47,40 @@ export const api = {
     return request('/api/auth/logout', { method: 'POST' });
   },
 
+  // ---- Workspaces (Code Repos) ----
+  listWorkspaces(): Promise<{ workspaces: WorkspaceDTO[] }> {
+    return request('/api/workspaces');
+  },
+
+  createWorkspace(name: string): Promise<{ workspace: WorkspaceDTO }> {
+    return request('/api/workspaces', {
+      method: 'POST',
+      body: JSON.stringify({ name }),
+    });
+  },
+
+  renameWorkspace(workspaceId: string, name: string): Promise<{ workspace: WorkspaceDTO }> {
+    return request(`/api/workspaces/${encodeURIComponent(workspaceId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ name }),
+    });
+  },
+
+  deleteWorkspace(workspaceId: string): Promise<{ ok: boolean }> {
+    return request(`/api/workspaces/${encodeURIComponent(workspaceId)}`, {
+      method: 'DELETE',
+    });
+  },
+
+  // ---- Projects (Conversation Threads) ----
   listProjects(): Promise<{ projects: ProjectDTO[] }> {
     return request('/api/projects');
   },
 
-  createProject(title?: string): Promise<{ project: ProjectDTO }> {
+  createProject(title?: string, workspaceId?: string | null): Promise<{ project: ProjectDTO }> {
     return request('/api/projects', {
       method: 'POST',
-      body: JSON.stringify({ title }),
+      body: JSON.stringify({ title, workspaceId: workspaceId ?? null }),
     });
   },
 
@@ -70,11 +97,26 @@ export const api = {
     return request(`/api/projects/${encodeURIComponent(id)}`, { method: 'DELETE' });
   },
 
+  bindWorkspace(
+    projectId: string,
+    payload: { workspaceId?: string; createNew?: boolean; name?: string },
+  ): Promise<{ ok: boolean; project: ProjectDTO; workspace: WorkspaceDTO }> {
+    return request(`/api/projects/${encodeURIComponent(projectId)}/bind-workspace`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
   sendMessage(
     projectId: string,
     content: string,
     forceBuild = false,
-  ): Promise<{ mode: 'chat' | 'build' | 'steered'; userMessage: MessageDTO; messageId?: string; runId?: string }> {
+  ): Promise<{
+    mode: 'chat' | 'build' | 'steered' | 'queued';
+    userMessage: MessageDTO;
+    messageId?: string;
+    runId?: string;
+  }> {
     return request(`/api/projects/${encodeURIComponent(projectId)}/messages`, {
       method: 'POST',
       body: JSON.stringify({ content, forceBuild }),
@@ -85,69 +127,70 @@ export const api = {
     return request(`/api/projects/${encodeURIComponent(projectId)}/abort`, { method: 'POST' });
   },
 
-  listFiles(projectId: string): Promise<{ files: FileTreeNode[] }> {
-    return request(`/api/projects/${encodeURIComponent(projectId)}/files`);
+  // ---- Workspace-Scoped Resources (Files / DB / Logs / Preview) ----
+  listFiles(workspaceId: string): Promise<{ files: FileTreeNode[] }> {
+    return request(`/api/workspaces/${encodeURIComponent(workspaceId)}/files`);
   },
 
-  initWorkspace(projectId: string): Promise<{ ok: boolean; project: ProjectDTO }> {
-    return request(`/api/projects/${encodeURIComponent(projectId)}/workspace/init`, {
-      method: 'POST',
-    });
-  },
-
-  readFile(projectId: string, filePath: string): Promise<{ path: string; content: string; binary?: boolean }> {
+  readFile(workspaceId: string, filePath: string): Promise<{ path: string; content: string; binary?: boolean }> {
     return request(
-      `/api/projects/${encodeURIComponent(projectId)}/file?path=${encodeURIComponent(filePath)}`,
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/file?path=${encodeURIComponent(filePath)}`,
     );
   },
 
-  writeFile(projectId: string, filePath: string, content: string): Promise<{ ok: boolean; path: string; bytes: number }> {
-    return request(`/api/projects/${encodeURIComponent(projectId)}/file`, {
+  writeFile(
+    workspaceId: string,
+    filePath: string,
+    content: string,
+  ): Promise<{ ok: boolean; path: string; bytes: number }> {
+    return request(`/api/workspaces/${encodeURIComponent(workspaceId)}/file`, {
       method: 'PUT',
       body: JSON.stringify({ path: filePath, content }),
     });
   },
 
   createEntry(
-    projectId: string,
+    workspaceId: string,
     filePath: string,
     type: 'file' | 'dir',
   ): Promise<{ ok: boolean; path: string; type: 'file' | 'dir' }> {
-    return request(`/api/projects/${encodeURIComponent(projectId)}/files/create`, {
+    return request(`/api/workspaces/${encodeURIComponent(workspaceId)}/files/create`, {
       method: 'POST',
       body: JSON.stringify({ path: filePath, type }),
     });
   },
 
-  deleteEntry(projectId: string, filePath: string): Promise<{ ok: boolean; path: string }> {
+  deleteEntry(workspaceId: string, filePath: string): Promise<{ ok: boolean; path: string }> {
     return request(
-      `/api/projects/${encodeURIComponent(projectId)}/file?path=${encodeURIComponent(filePath)}`,
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/file?path=${encodeURIComponent(filePath)}`,
       { method: 'DELETE' },
     );
   },
 
   getLogs(
-    projectId: string,
+    workspaceId: string,
   ): Promise<{ running: boolean; port: number | null; logs: string[]; hasDb: boolean; tableCount: number }> {
-    return request(`/api/projects/${encodeURIComponent(projectId)}/logs`);
+    return request(`/api/workspaces/${encodeURIComponent(workspaceId)}/logs`);
   },
 
   getTables(
-    projectId: string,
+    workspaceId: string,
   ): Promise<{ prefix: string; preset?: AgentPresetSummary; tables: TableInfoDTO[] }> {
-    return request(`/api/projects/${encodeURIComponent(projectId)}/tables`);
+    return request(`/api/workspaces/${encodeURIComponent(workspaceId)}/tables`);
   },
 
   getTableRows(
-    projectId: string,
+    workspaceId: string,
     table: string,
   ): Promise<{ logicalName: string; physicalName: string; rows: Record<string, unknown>[] }> {
     return request(
-      `/api/projects/${encodeURIComponent(projectId)}/tables/${encodeURIComponent(table)}/rows`,
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/tables/${encodeURIComponent(table)}/rows`,
     );
   },
 
-  restartPreview(projectId: string): Promise<{ ok: boolean; previewUrl: string }> {
-    return request(`/api/projects/${encodeURIComponent(projectId)}/preview/restart`, { method: 'POST' });
+  restartPreview(workspaceId: string): Promise<{ ok: boolean; previewUrl: string }> {
+    return request(`/api/workspaces/${encodeURIComponent(workspaceId)}/preview/restart`, {
+      method: 'POST',
+    });
   },
 };

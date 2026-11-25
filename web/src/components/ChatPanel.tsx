@@ -6,16 +6,21 @@ import {
   Hammer,
   Bot,
   User,
-  Database,
   ExternalLink,
   Code2,
+  FolderGit2,
+  FolderPlus,
+  Link2,
+  ChevronDown,
+  Clock,
 } from 'lucide-react';
-import type { AgentToolStep, MessageDTO, ProjectDTO } from '@atoms/shared';
+import type { AgentToolStep, MessageDTO, ProjectDTO, WorkspaceDTO } from '@atoms/shared';
 import { AgentStepCard } from './AgentStepCard';
 
 export interface LiveStreamState {
   messageId: string;
   mode: 'chat' | 'build';
+  queued?: boolean;
   text: string;
   thinking: string;
   steps: AgentToolStep[];
@@ -27,6 +32,8 @@ export interface LiveStreamState {
 
 interface ChatPanelProps {
   project: ProjectDTO | null;
+  workspace: WorkspaceDTO | null;
+  workspaces: WorkspaceDTO[];
   messages: MessageDTO[];
   liveStream: LiveStreamState | null;
   isBuilding: boolean;
@@ -35,7 +42,8 @@ interface ChatPanelProps {
   onSend: (text: string, forceBuild?: boolean) => Promise<void>;
   onAbort: () => Promise<void>;
   onOpenPreview: () => void;
-  onInitWorkspace: () => Promise<void>;
+  onOpenVsCode: () => void;
+  onBindWorkspace: (opts: { workspaceId?: string; createNew?: boolean; name?: string }) => Promise<void>;
 }
 
 const STARTER_PROMPTS = [
@@ -55,6 +63,8 @@ const STARTER_PROMPTS = [
 
 export const ChatPanel: React.FC<ChatPanelProps> = ({
   project,
+  workspace,
+  workspaces,
   messages,
   liveStream,
   isBuilding,
@@ -63,15 +73,34 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   onSend,
   onAbort,
   onOpenPreview,
-  onInitWorkspace,
+  onOpenVsCode,
+  onBindWorkspace,
 }) => {
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
+  const [bindMenuOpen, setBindMenuOpen] = useState(false);
+  const [binding, setBinding] = useState(false);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages.length, liveStream?.text, liveStream?.steps.length, liveStream?.statusText]);
+
+  useEffect(() => {
+    setBindMenuOpen(false);
+  }, [project?.id, workspace?.id]);
+
+  useEffect(() => {
+    if (!bindMenuOpen) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setBindMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, [bindMenuOpen]);
 
   const submit = async (overrideText?: string, forceBuild = false) => {
     const content = (overrideText ?? input).trim();
@@ -85,6 +114,16 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
     }
   };
 
+  const handleBind = async (opts: { workspaceId?: string; createNew?: boolean; name?: string }) => {
+    setBinding(true);
+    setBindMenuOpen(false);
+    try {
+      await onBindWorkspace(opts);
+    } finally {
+      setBinding(false);
+    }
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -93,39 +132,104 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   };
 
   const isEmpty = messages.length === 0 && !liveStream;
+  const isQueued = Boolean(liveStream?.queued || project?.status === 'queued');
 
   return (
     <div className="flex-1 flex flex-col min-w-0 bg-white">
       {/* Header */}
       <div className="h-13 px-5 border-b border-slate-200 flex items-center justify-between gap-3 shrink-0">
-        <div className="min-w-0 flex items-center gap-2.5">
+        <div className="min-w-0 flex items-center gap-2">
           <h2 className="text-sm font-semibold text-slate-900 truncate">
             {project ? project.title : '新对话'}
           </h2>
-          {(project?.status === 'building' || isBuilding) && (
-            <span className="inline-flex items-center gap-1.5 text-[11px] font-medium px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200">
+
+          {workspace && (
+            <button
+              type="button"
+              onClick={onOpenVsCode}
+              title={`当前对话绑定代码仓库：${workspace.name} (${workspace.id})，点击打开 VS Code`}
+              className="inline-flex items-center gap-1.5 text-[11px] font-medium px-2 py-0.5 rounded-full bg-slate-100 hover:bg-indigo-50 text-slate-700 hover:text-indigo-700 border border-slate-200 transition cursor-pointer shrink-0 max-w-[200px]"
+            >
+              <FolderGit2 className="w-3 h-3 text-indigo-600 shrink-0" />
+              <span className="truncate">{workspace.name}</span>
+            </button>
+          )}
+
+          {isQueued ? (
+            <span className="inline-flex items-center gap-1 text-[11px] font-medium px-2 py-0.5 rounded-full bg-amber-50 text-amber-800 border border-amber-200 shrink-0">
+              <Clock className="w-3 h-3" />
+              排队等待同仓库
+            </span>
+          ) : (project?.status === 'building' || isBuilding) ? (
+            <span className="inline-flex items-center gap-1.5 text-[11px] font-medium px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200 shrink-0">
               <span className="w-1.5 h-1.5 rounded-full bg-indigo-600 animate-ping" />
               Agent 开发中
             </span>
-          )}
-          {project?.hasWorkspace && project.status !== 'building' && !isBuilding && (
-            <span className="inline-flex items-center gap-1 text-[11px] font-medium px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">
-              <Database className="w-3 h-3" />
-              全栈已就绪
-            </span>
-          )}
+          ) : null}
         </div>
 
-        {project && !project.hasWorkspace && !isBuilding && (
+        {/* Right Header Actions */}
+        {project && !workspace && !isBuilding && (
           <div className="flex items-center gap-2 shrink-0">
-            <button
-              type="button"
-              onClick={() => void onInitWorkspace()}
-              className="inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 transition cursor-pointer"
-            >
-              <Code2 className="w-3.5 h-3.5" />
-              打开 VS Code
-            </button>
+            <div className="relative" ref={menuRef}>
+              <button
+                type="button"
+                disabled={binding}
+                onClick={() => setBindMenuOpen((v) => !v)}
+                className="inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 transition cursor-pointer"
+              >
+                <Code2 className="w-3.5 h-3.5" />
+                {binding ? '挂载中...' : '打开 VS Code / 关联仓库'}
+                <ChevronDown className="w-3 h-3 text-slate-500" />
+              </button>
+
+              {bindMenuOpen && (
+                <div className="absolute right-0 mt-1.5 w-64 rounded-xl bg-white border border-slate-200 shadow-xl py-1.5 z-30">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const defaultName = project.title !== '新对话' ? project.title : '新代码项目';
+                      const inputName = window.prompt('输入新代码仓库名称：', defaultName);
+                      if (inputName === null) return;
+                      void handleBind({ createNew: true, name: inputName.trim() || defaultName });
+                    }}
+                    className="w-full px-3 py-2 text-left text-xs hover:bg-indigo-50 text-slate-800 flex items-center gap-2 cursor-pointer"
+                  >
+                    <FolderPlus className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
+                    <div>
+                      <div className="font-medium">新建独立代码仓库</div>
+                      <div className="text-[10px] text-slate-500">创建全新目录与独立 SQLite 空间</div>
+                    </div>
+                  </button>
+
+                  {workspaces.length > 0 && (
+                    <>
+                      <div className="my-1 border-t border-slate-100" />
+                      <div className="px-3 py-1 text-[10px] font-medium text-slate-400 uppercase tracking-wider">
+                        或关联到已有代码仓库
+                      </div>
+                      <div className="max-h-48 overflow-y-auto">
+                        {workspaces.map((ws) => (
+                          <button
+                            key={ws.id}
+                            type="button"
+                            onClick={() => void handleBind({ workspaceId: ws.id })}
+                            className="w-full px-3 py-1.5 text-left text-xs hover:bg-slate-50 text-slate-700 flex items-center gap-2 cursor-pointer"
+                          >
+                            <Link2 className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                            <div className="min-w-0 flex-1">
+                              <div className="truncate font-medium">{ws.name}</div>
+                              <div className="text-[10px] font-mono text-slate-400 truncate">{ws.id}</div>
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+
             {messages.length > 0 && (
               <button
                 type="button"
@@ -144,7 +248,8 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
 
       {!glmConfigured && (
         <div className="mx-5 mt-3 px-3.5 py-2.5 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-800">
-          提示：后端尚未配置 <code className="font-mono font-semibold">GLM_API_KEY</code>，请在 <code className="font-mono">.env</code> 填入智谱 API Key 并重启服务。
+          提示：后端尚未配置 <code className="font-mono font-semibold">GLM_API_KEY</code>，请在{' '}
+          <code className="font-mono">.env</code> 填入智谱 API Key 并重启服务。
         </div>
       )}
 
@@ -156,27 +261,31 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
               <Sparkles className="w-6 h-6" />
             </div>
             <h1 className="text-2xl font-bold text-slate-900 tracking-tight">
-              告诉我你想构建什么网站？
+              {workspace ? `在仓库「${workspace.name}」中开始新任务` : '告诉我你想构建什么网站？'}
             </h1>
             <p className="mt-2 text-sm text-slate-500 leading-relaxed">
-              先聊想法或直接下达构建指令——我会自动创建项目上下文，并在识别到全栈构建需求时，启动云端隔离 Coding Agent 自动写代码、配 SQLite 持久化数据库并生成可交互预览。
+              {workspace
+                ? '此对话已绑定右侧代码仓库与 SQLite 数据空间。你可以直接描述新增功能、修复问题或修改样式，同仓库若已有其他对话正在构建，系统会自动安全排队。'
+                : '先聊想法或直接下达构建指令——每个代码仓库拥有独立目录、VS Code LSP 与 SQLite 空间，同一仓库支持开启多个并行对话协作。'}
             </p>
 
-            <div className="mt-7 w-full grid gap-2.5 text-left">
-              {STARTER_PROMPTS.map((item) => (
-                <button
-                  key={item.title}
-                  type="button"
-                  onClick={() => void submit(item.prompt)}
-                  className="p-3.5 rounded-xl border border-slate-200 hover:border-indigo-300 hover:bg-indigo-50/40 transition group cursor-pointer"
-                >
-                  <div className="text-xs font-semibold text-slate-800 group-hover:text-indigo-700">
-                    {item.title}
-                  </div>
-                  <div className="mt-1 text-xs text-slate-500 line-clamp-2">{item.prompt}</div>
-                </button>
-              ))}
-            </div>
+            {!workspace && (
+              <div className="mt-7 w-full grid gap-2.5 text-left">
+                {STARTER_PROMPTS.map((item) => (
+                  <button
+                    key={item.title}
+                    type="button"
+                    onClick={() => void submit(item.prompt)}
+                    className="p-3.5 rounded-xl border border-slate-200 hover:border-indigo-300 hover:bg-indigo-50/40 transition group cursor-pointer"
+                  >
+                    <div className="text-xs font-semibold text-slate-800 group-hover:text-indigo-700">
+                      {item.title}
+                    </div>
+                    <div className="mt-1 text-xs text-slate-500 line-clamp-2">{item.prompt}</div>
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
         ) : (
           <div className="max-w-3xl mx-auto space-y-5">
@@ -230,7 +339,11 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
 
             {liveStream && (
               <div className="flex gap-3 justify-start">
-                <div className="w-7 h-7 rounded-lg bg-indigo-600 text-white flex items-center justify-center shrink-0 mt-0.5">
+                <div
+                  className={`w-7 h-7 rounded-lg text-white flex items-center justify-center shrink-0 mt-0.5 ${
+                    liveStream.queued ? 'bg-amber-500' : 'bg-indigo-600'
+                  }`}
+                >
                   <Bot className="w-4 h-4" />
                 </div>
                 <div className="max-w-[85%] flex-1 rounded-2xl rounded-bl-md px-4 py-3 text-sm leading-relaxed bg-slate-50 border border-indigo-200/80 text-slate-800">
@@ -240,6 +353,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                       steps={liveStream.steps}
                       statusText={liveStream.statusText}
                       isRunning={true}
+                      isQueued={liveStream.queued}
                       startedAt={liveStream.startedAt}
                       lastActivityAt={liveStream.lastActivityAt}
                     />
@@ -251,7 +365,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
               </div>
             )}
 
-            {suggestBuild && !isBuilding && project && !project.hasWorkspace && (
+            {suggestBuild && !isBuilding && project && !workspace && (
               <div className="flex justify-start pl-10">
                 <button
                   type="button"
@@ -259,7 +373,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                   className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-medium shadow-sm transition cursor-pointer"
                 >
                   <Hammer className="w-3.5 h-3.5" />
-                  确认方案，启动云端 Coding Agent 开始构建
+                  确认方案，新建代码仓库并启动构建
                 </button>
               </div>
             )}
@@ -279,11 +393,13 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
               placeholder={
-                isBuilding
-                  ? 'Agent 正在开发中，输入补充要求可实时插话调整（Enter 发送）...'
-                  : project?.hasWorkspace
-                    ? '继续描述你想新增的功能、修改的样式或修复的问题（Enter 发送）...'
-                    : '描述你想构建的网站或先聊聊需求，支持前端交互 + SQLite 持久化（Enter 发送）...'
+                isQueued
+                  ? '任务正在排队等待同仓库前序修改完成，可输入补充要求合并进队列（Enter 发送）...'
+                  : isBuilding
+                    ? 'Agent 正在开发中，输入补充要求可实时插话调整（Enter 发送）...'
+                    : workspace
+                      ? `向仓库「${workspace.name}」发送新增功能、样式调整或 Bug 修复指令（Enter 发送）...`
+                      : '描述你想构建的网站或先聊聊需求（Enter 发送）...'
               }
               className="flex-1 bg-transparent resize-none outline-none text-sm text-slate-800 placeholder:text-slate-400 px-2 py-1 max-h-36"
             />
@@ -291,11 +407,11 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
               <button
                 type="button"
                 onClick={() => void onAbort()}
-                title="停止当前构建"
+                title={isQueued ? '取消排队' : '停止当前构建'}
                 className="px-3 py-2 rounded-xl bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 text-xs font-medium flex items-center gap-1.5 transition cursor-pointer shrink-0"
               >
                 <Square className="w-3.5 h-3.5 fill-current" />
-                停止
+                {isQueued ? '取消排队' : '停止'}
               </button>
             )}
             <button
@@ -303,7 +419,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
               disabled={!input.trim() || sending}
               onClick={() => void submit()}
               className="p-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white transition cursor-pointer shrink-0"
-              title={isBuilding ? '发送插话指令' : '发送'}
+              title={isBuilding ? '发送补充指令' : '发送'}
             >
               <Send className="w-4 h-4" />
             </button>

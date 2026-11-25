@@ -2,9 +2,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import express from 'express';
 import cookieParser from 'cookie-parser';
-import type { ActiveRunSnapshot, ProjectDTO } from '@atoms/shared';
+import type { ActiveRunSnapshot, ProjectDTO, WorkspaceDTO } from '@atoms/shared';
 import { config, ensureDataDirs } from './config.js';
-import { dbStore, generateId, toProjectDTO } from './db.js';
+import { dbStore, generateId, toProjectDTO, toWorkspaceDTO, type WorkspaceRow } from './db.js';
 import { buildTablePrefix, createDbProxyRouter, dbProxy } from './db-proxy.js';
 import {
   clearSessionCookie,
@@ -26,7 +26,7 @@ pluginRegistry.reload();
 const recoveredStale = dbStore.recoverStaleBuildingProjects();
 if (recoveredStale.length > 0) {
   console.log(
-    `[atoms-server] Recovered ${recoveredStale.length} stale building project(s): ${recoveredStale.map((r) => r.id).join(', ')}`,
+    `[atoms-server] Recovered ${recoveredStale.length} stale building/queued project(s): ${recoveredStale.map((r) => r.id).join(', ')}`,
   );
 }
 
@@ -44,28 +44,36 @@ app.set('trust proxy', 1);
 app.use(cookieParser());
 
 // ---------------------------------------------------------------------------
-// Public Preview Reverse Proxy (placed BEFORE express.json so raw bodies pipe)
+// Public Preview Reverse Proxy (keyed by workspaceId; legacy projectId supported)
 // ---------------------------------------------------------------------------
-app.use('/preview/:projectId', (req, res) => {
-  const projectId = String(req.params.projectId || '');
+app.use('/preview/:targetId', (req, res) => {
+  const targetId = String(req.params.targetId || '');
   const urlWithoutQuery = req.originalUrl.split('?')[0];
-  if (urlWithoutQuery === `/preview/${projectId}`) {
+  if (urlWithoutQuery === `/preview/${targetId}`) {
     const qIdx = req.originalUrl.indexOf('?');
     const qs = qIdx !== -1 ? req.originalUrl.slice(qIdx) : '';
-    res.redirect(302, `/preview/${projectId}/${qs}`);
+    res.redirect(302, `/preview/${targetId}/${qs}`);
     return;
   }
-  const project = dbStore.getProject(projectId);
-  if (!project) {
-    res.status(404).send('Project not found.');
+
+  let ws = dbStore.getWorkspace(targetId);
+  if (!ws) {
+    const proj = dbStore.getProject(targetId);
+    if (proj?.workspace_id) {
+      ws = dbStore.getWorkspace(proj.workspace_id);
+    }
+  }
+  if (!ws) {
+    res.status(404).send('Workspace not found.');
     return;
   }
+
   const subPath = req.url || '/';
   void previewManager.proxyRequest(
     req,
     res,
-    projectId,
-    { owner: project.owner, presetId: project.preset_id },
+    ws.id,
+    { owner: ws.owner, presetId: ws.preset_id },
     subPath,
   );
 });
@@ -73,8 +81,7 @@ app.use('/preview/:projectId', (req, res) => {
 app.use(express.json({ limit: '2mb' }));
 
 // ---------------------------------------------------------------------------
-// Scoped DB Proxy API (authenticated via project-scoped Bearer token)
-// Used by Pi's atoms_db MCP server AND generated app's server/db.js runtime SDK
+// Scoped DB Proxy API (authenticated via workspace-scoped Bearer token)
 // ---------------------------------------------------------------------------
 app.use('/api/db-proxy', createDbProxyRouter());
 
@@ -132,18 +139,30 @@ app.get('/api/presets', requireAuth, (_req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// Protected Project & Agent API Routes
+// Helpers for Enriching Workspaces & Projects (Threads)
 // ---------------------------------------------------------------------------
+function enrichWorkspace(row: WorkspaceRow | undefined): WorkspaceDTO | null {
+  if (!row) return null;
+  return toWorkspaceDTO(
+    row,
+    previewManager.isRunning(row.id),
+    piManager.getWorkspaceBuildState(row.id),
+  );
+}
+
 function enrichProject(row: ReturnType<typeof dbStore.getProject>): ProjectDTO | null {
   if (!row) return null;
-  const hasWs = Boolean(row.has_workspace) || previewManager.hasWorkspace(row.id);
-  const effectiveRow = hasWs !== Boolean(row.has_workspace) ? { ...row, has_workspace: 1 } : row;
+  const ws = row.workspace_id ? dbStore.getWorkspace(row.workspace_id) : undefined;
   const summary = piManager.getActiveSummary(row.id);
   const chatSnap = activeChatRuns.get(row.id);
-  const base = toProjectDTO(effectiveRow, previewManager.isRunning(row.id));
+  const base = toProjectDTO(
+    row,
+    ws ? previewManager.isRunning(ws.id) : false,
+    ws?.name ?? null,
+  );
   return {
     ...base,
-    status: summary.isBuilding ? 'building' : base.status,
+    status: summary.isBuilding ? (summary.queued ? 'queued' : 'building') : base.status,
     activeStep: summary.isBuilding
       ? summary.activeStep
       : chatSnap
@@ -157,6 +176,14 @@ function enrichProject(row: ReturnType<typeof dbStore.getProject>): ProjectDTO |
   };
 }
 
+function assertOwnedWorkspace(req: AuthenticatedRequest, workspaceId: string) {
+  const row = dbStore.getWorkspace(workspaceId);
+  if (!row || row.owner !== req.user?.username) {
+    return null;
+  }
+  return row;
+}
+
 function assertOwnedProject(req: AuthenticatedRequest, projectId: string) {
   const row = dbStore.getProject(projectId);
   if (!row || row.owner !== req.user?.username) {
@@ -165,7 +192,34 @@ function assertOwnedProject(req: AuthenticatedRequest, projectId: string) {
   return row;
 }
 
-// User-level global SSE stream for real-time cross-project sidebar status & notifications
+async function ensureBoundWorkspaceForProject(
+  projectId: string,
+  owner: string,
+  preferredName?: string,
+  presetId?: string,
+): Promise<{ workspace: WorkspaceRow; created: boolean }> {
+  const proj = dbStore.getProject(projectId);
+  if (!proj) throw new Error('Project not found');
+  if (proj.workspace_id) {
+    const existing = dbStore.getWorkspace(proj.workspace_id);
+    if (existing) {
+      const { created } = await previewManager.ensureWorkspace(existing.id, existing.preset_id);
+      return { workspace: existing, created };
+    }
+  }
+  const resolvedPreset = pluginRegistry.getPreset(presetId || proj.preset_id).manifest.id;
+  const wsName = (preferredName || proj.title || '新代码仓库').trim().slice(0, 40);
+  const ws = dbStore.createWorkspace(owner, wsName, resolvedPreset);
+  await previewManager.ensureWorkspace(ws.id, ws.preset_id);
+  dbStore.updateProject(projectId, { workspaceId: ws.id });
+  const wsDto = enrichWorkspace(ws)!;
+  eventBus.emitUser(owner, { type: 'workspace_updated', workspace: wsDto });
+  return { workspace: ws, created: true };
+}
+
+// ---------------------------------------------------------------------------
+// User-level Global SSE Stream (Sidebar & Cross-Workspace Realtime Sync)
+// ---------------------------------------------------------------------------
 app.get('/api/events', requireAuth, (req: AuthenticatedRequest, res) => {
   const username = req.user!.username;
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
@@ -182,6 +236,226 @@ app.get('/api/events', requireAuth, (req: AuthenticatedRequest, res) => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// First-Class Workspace (Code Repo) APIs
+// ---------------------------------------------------------------------------
+app.get('/api/workspaces', requireAuth, (req: AuthenticatedRequest, res) => {
+  const rows = dbStore.listWorkspaces(req.user!.username);
+  res.json({
+    workspaces: rows.map((r) => enrichWorkspace(r)!),
+  });
+});
+
+app.post('/api/workspaces', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const { name, presetId } = (req.body || {}) as { name?: string; presetId?: string };
+  const resolvedPreset = pluginRegistry.getPreset(presetId).manifest.id;
+  const wsName = (name || '新代码项目').trim().slice(0, 40);
+  try {
+    const ws = dbStore.createWorkspace(req.user!.username, wsName, resolvedPreset);
+    await previewManager.ensureWorkspace(ws.id, ws.preset_id);
+    const dto = enrichWorkspace(ws)!;
+    eventBus.emitUser(req.user!.username, { type: 'workspace_updated', workspace: dto });
+    res.status(201).json({ workspace: dto });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.patch('/api/workspaces/:wsId', requireAuth, (req: AuthenticatedRequest, res) => {
+  const ws = assertOwnedWorkspace(req, String(req.params.wsId));
+  if (!ws) {
+    res.status(404).json({ error: 'Workspace not found' });
+    return;
+  }
+  const { name } = (req.body || {}) as { name?: string };
+  const cleanName = (name || '').trim().slice(0, 40);
+  if (!cleanName) {
+    res.status(400).json({ error: 'Workspace name is required' });
+    return;
+  }
+  const updated = dbStore.updateWorkspace(ws.id, { name: cleanName })!;
+  const dto = enrichWorkspace(updated)!;
+  eventBus.emitUser(ws.owner, { type: 'workspace_updated', workspace: dto });
+  for (const proj of dbStore.listProjectsByWorkspace(ws.id)) {
+    const pdto = enrichProject(proj)!;
+    eventBus.emit(proj.id, { type: 'project_updated', project: pdto });
+    eventBus.emitUser(ws.owner, { type: 'project_updated', project: pdto });
+  }
+  res.json({ workspace: dto });
+});
+
+app.delete('/api/workspaces/:wsId', requireAuth, (req: AuthenticatedRequest, res) => {
+  const ws = assertOwnedWorkspace(req, String(req.params.wsId));
+  if (!ws) {
+    res.status(404).json({ error: 'Workspace not found' });
+    return;
+  }
+  const linkedProjects = dbStore.listProjectsByWorkspace(ws.id);
+  piManager.abortWorkspace(ws.id);
+  previewManager.deleteWorkspace(ws.owner, ws.id);
+  dbStore.deleteWorkspace(ws.id);
+  eventBus.emitUser(ws.owner, { type: 'workspace_deleted', workspaceId: ws.id });
+  for (const proj of linkedProjects) {
+    const latest = dbStore.getProject(proj.id);
+    if (latest) {
+      const pdto = enrichProject(latest)!;
+      eventBus.emit(proj.id, { type: 'project_updated', project: pdto });
+      eventBus.emitUser(ws.owner, { type: 'project_updated', project: pdto });
+    }
+  }
+  res.json({ ok: true });
+});
+
+app.get('/api/workspaces/:wsId/files', requireAuth, (req: AuthenticatedRequest, res) => {
+  const ws = assertOwnedWorkspace(req, String(req.params.wsId));
+  if (!ws) {
+    res.status(404).json({ error: 'Workspace not found' });
+    return;
+  }
+  res.json({ files: previewManager.listFiles(ws.id) });
+});
+
+app.get('/api/workspaces/:wsId/file', requireAuth, (req: AuthenticatedRequest, res) => {
+  const ws = assertOwnedWorkspace(req, String(req.params.wsId));
+  if (!ws) {
+    res.status(404).json({ error: 'Workspace not found' });
+    return;
+  }
+  const filePath = String(req.query.path || '');
+  if (!filePath) {
+    res.status(400).json({ error: 'Missing path query' });
+    return;
+  }
+  try {
+    res.json(previewManager.readFile(ws.id, filePath));
+  } catch (err) {
+    res.status(404).json({ error: err instanceof Error ? err.message : 'File not found' });
+  }
+});
+
+app.put('/api/workspaces/:wsId/file', requireAuth, (req: AuthenticatedRequest, res) => {
+  const ws = assertOwnedWorkspace(req, String(req.params.wsId));
+  if (!ws) {
+    res.status(404).json({ error: 'Workspace not found' });
+    return;
+  }
+  const { path: filePath, content } = (req.body || {}) as { path?: string; content?: string };
+  if (!filePath || typeof content !== 'string') {
+    res.status(400).json({ error: 'path and content are required' });
+    return;
+  }
+  try {
+    const saved = previewManager.writeFile(ws.id, filePath, content);
+    res.json({ ok: true, ...saved });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.post('/api/workspaces/:wsId/files/create', requireAuth, (req: AuthenticatedRequest, res) => {
+  const ws = assertOwnedWorkspace(req, String(req.params.wsId));
+  if (!ws) {
+    res.status(404).json({ error: 'Workspace not found' });
+    return;
+  }
+  const { path: filePath, type } = (req.body || {}) as { path?: string; type?: 'file' | 'dir' };
+  if (!filePath || (type !== 'file' && type !== 'dir')) {
+    res.status(400).json({ error: 'path and type ("file" | "dir") are required' });
+    return;
+  }
+  try {
+    const created = previewManager.createEntry(ws.id, filePath, type);
+    res.status(201).json({ ok: true, ...created });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.delete('/api/workspaces/:wsId/file', requireAuth, (req: AuthenticatedRequest, res) => {
+  const ws = assertOwnedWorkspace(req, String(req.params.wsId));
+  if (!ws) {
+    res.status(404).json({ error: 'Workspace not found' });
+    return;
+  }
+  const filePath = String(req.query.path || '');
+  if (!filePath) {
+    res.status(400).json({ error: 'Missing path query' });
+    return;
+  }
+  try {
+    const deleted = previewManager.deleteEntry(ws.id, filePath);
+    res.json({ ok: true, ...deleted });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.get('/api/workspaces/:wsId/tables', requireAuth, (req: AuthenticatedRequest, res) => {
+  const ws = assertOwnedWorkspace(req, String(req.params.wsId));
+  if (!ws) {
+    res.status(404).json({ error: 'Workspace not found' });
+    return;
+  }
+  const prefix = buildTablePrefix(ws.owner, ws.id);
+  const preset = pluginRegistry.listPresets().find((p) => p.id === ws.preset_id);
+  const tables = dbProxy.listTables({ owner: ws.owner, projectId: ws.id, prefix });
+  res.json({ prefix, preset, tables });
+});
+
+app.get('/api/workspaces/:wsId/tables/:table/rows', requireAuth, (req: AuthenticatedRequest, res) => {
+  const ws = assertOwnedWorkspace(req, String(req.params.wsId));
+  if (!ws) {
+    res.status(404).json({ error: 'Workspace not found' });
+    return;
+  }
+  const prefix = buildTablePrefix(ws.owner, ws.id);
+  try {
+    const data = dbProxy.previewTableRows(
+      { owner: ws.owner, projectId: ws.id, prefix },
+      String(req.params.table || ''),
+      Number(req.query.limit || 30),
+    );
+    res.json(data);
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.get('/api/workspaces/:wsId/logs', requireAuth, (req: AuthenticatedRequest, res) => {
+  const ws = assertOwnedWorkspace(req, String(req.params.wsId));
+  if (!ws) {
+    res.status(404).json({ error: 'Workspace not found' });
+    return;
+  }
+  res.json(previewManager.getLogs(ws.owner, ws.id));
+});
+
+app.post('/api/workspaces/:wsId/preview/restart', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const ws = assertOwnedWorkspace(req, String(req.params.wsId));
+  if (!ws) {
+    res.status(404).json({ error: 'Workspace not found' });
+    return;
+  }
+  try {
+    const previewUrl = await previewManager.restartApp(
+      ws.id,
+      { owner: ws.owner, presetId: ws.preset_id },
+      true,
+    );
+    for (const proj of dbStore.listProjectsByWorkspace(ws.id)) {
+      eventBus.emit(proj.id, { type: 'preview_ready', projectId: proj.id, previewUrl });
+    }
+    const wsDto = enrichWorkspace(ws)!;
+    eventBus.emitUser(ws.owner, { type: 'workspace_updated', workspace: wsDto });
+    res.json({ ok: true, previewUrl });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Protected Project (Conversation Thread) & Agent API Routes
+// ---------------------------------------------------------------------------
 app.get('/api/projects', requireAuth, (req: AuthenticatedRequest, res) => {
   const rows = dbStore.listProjects(req.user!.username);
   res.json({
@@ -190,12 +464,29 @@ app.get('/api/projects', requireAuth, (req: AuthenticatedRequest, res) => {
 });
 
 app.post('/api/projects', requireAuth, (req: AuthenticatedRequest, res) => {
-  const { title, presetId } = (req.body || {}) as { title?: string; presetId?: string };
-  const resolvedPreset = pluginRegistry.getPreset(presetId).manifest.id;
+  const { title, presetId, workspaceId } = (req.body || {}) as {
+    title?: string;
+    presetId?: string;
+    workspaceId?: string | null;
+  };
+
+  let boundWsId: string | null = null;
+  let resolvedPreset = pluginRegistry.getPreset(presetId).manifest.id;
+  if (workspaceId) {
+    const ws = assertOwnedWorkspace(req, workspaceId);
+    if (!ws) {
+      res.status(404).json({ error: 'Workspace not found' });
+      return;
+    }
+    boundWsId = ws.id;
+    resolvedPreset = ws.preset_id;
+  }
+
   const row = dbStore.createProject(
     req.user!.username,
     (title || '新对话').trim().slice(0, 40),
     resolvedPreset,
+    boundWsId,
   );
   const dto = enrichProject(row)!;
   eventBus.emitUser(req.user!.username, { type: 'project_updated', project: dto });
@@ -225,10 +516,50 @@ app.delete('/api/projects/:id', requireAuth, (req: AuthenticatedRequest, res) =>
   }
   activeChatRuns.delete(row.id);
   piManager.abort(row.id);
-  previewManager.deleteWorkspace(row.owner, row.id);
+  // Deleting a conversation thread NEVER deletes the shared Workspace repo & DB tables
   dbStore.deleteProject(row.id);
   eventBus.emitUser(row.owner, { type: 'project_deleted', projectId: row.id });
   res.json({ ok: true });
+});
+
+app.post('/api/projects/:id/bind-workspace', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const row = assertOwnedProject(req, String(req.params.id));
+  if (!row) {
+    res.status(404).json({ error: 'Project not found' });
+    return;
+  }
+  const { workspaceId, createNew, name } = (req.body || {}) as {
+    workspaceId?: string;
+    createNew?: boolean;
+    name?: string;
+  };
+
+  try {
+    let targetWs: WorkspaceRow;
+    if (createNew || !workspaceId) {
+      const wsName = (name || (row.title !== '新对话' ? row.title : '新代码项目')).trim().slice(0, 40);
+      targetWs = dbStore.createWorkspace(row.owner, wsName, row.preset_id);
+      await previewManager.ensureWorkspace(targetWs.id, targetWs.preset_id);
+    } else {
+      const found = assertOwnedWorkspace(req, workspaceId);
+      if (!found) {
+        res.status(404).json({ error: 'Workspace not found' });
+        return;
+      }
+      targetWs = found;
+      await previewManager.ensureWorkspace(targetWs.id, targetWs.preset_id);
+    }
+
+    const updated = dbStore.updateProject(row.id, { workspaceId: targetWs.id })!;
+    const projDto = enrichProject(updated)!;
+    const wsDto = enrichWorkspace(targetWs)!;
+    eventBus.emit(row.id, { type: 'project_updated', project: projDto });
+    eventBus.emitUser(row.owner, { type: 'workspace_updated', workspace: wsDto });
+    eventBus.emitUser(row.owner, { type: 'project_updated', project: projDto });
+    res.json({ ok: true, project: projDto, workspace: wsDto });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
 });
 
 app.get('/api/projects/:id/events', requireAuth, (req: AuthenticatedRequest, res) => {
@@ -280,36 +611,43 @@ app.post('/api/projects/:id/messages', requireAuth, async (req: AuthenticatedReq
   eventBus.emit(row.id, { type: 'message_created', message: userMsg });
 
   const isFirstTurn = historyBefore.length === 0;
-  const appCtx = { owner: row.owner, presetId: row.preset_id };
 
-  if (piManager.isRunning(row.id)) {
-    try {
-      const workspaceDir = previewManager.getWorkspaceDir(row.id);
-      const result = await piManager.startOrSteer({
-        owner: row.owner,
-        projectId: row.id,
-        presetId: row.preset_id,
-        workspaceDir,
-        userMessage: text,
-        history: historyBefore,
-        isInitialBuild: false,
-        onSettled: async (pid) => previewManager.restartApp(pid, appCtx, true),
-      });
-      res.json({ mode: 'steered', userMessage: userMsg, runId: result.runId });
-    } catch (err) {
-      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+  // If this thread is already running or queued, steer / append directly
+  if (piManager.isRunning(row.id) && row.workspace_id) {
+    const ws = dbStore.getWorkspace(row.workspace_id);
+    if (ws) {
+      try {
+        const workspaceDir = previewManager.getWorkspaceDir(ws.id);
+        const appCtx = { owner: ws.owner, presetId: ws.preset_id };
+        const result = await piManager.startOrSteer({
+          owner: row.owner,
+          projectId: row.id,
+          workspaceId: ws.id,
+          presetId: ws.preset_id,
+          workspaceDir,
+          userMessage: text,
+          history: historyBefore,
+          isInitialBuild: false,
+          onSettled: async (wsId) => previewManager.restartApp(wsId, appCtx, true),
+        });
+        res.json({ mode: result.mode, userMessage: userMsg, runId: result.runId, messageId: result.messageId });
+      } catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
     }
-    return;
   }
 
-  const hasWs = Boolean(row.has_workspace) || previewManager.hasWorkspace(row.id);
+  const hasWs = Boolean(row.workspace_id);
 
   const decision = forceBuild
     ? { intent: 'build' as const, title: undefined, reason: 'explicit_button' }
     : await classifyIntent(historyBefore, text, hasWs);
 
+  let currentTitle = row.title;
   if (isFirstTurn || row.title === '新对话') {
     const newTitle = decision.title || deriveFallbackTitle(text);
+    currentTitle = newTitle;
     const updated = dbStore.updateProject(row.id, { title: newTitle });
     if (updated) {
       const dto = enrichProject(updated)!;
@@ -320,19 +658,27 @@ app.post('/api/projects/:id/messages', requireAuth, async (req: AuthenticatedReq
 
   if (decision.intent === 'build') {
     try {
-      const { workspaceDir, created } = await previewManager.ensureWorkspace(row.id, row.preset_id);
+      const { workspace, created } = await ensureBoundWorkspaceForProject(
+        row.id,
+        row.owner,
+        currentTitle,
+        row.preset_id,
+      );
+      const workspaceDir = previewManager.getWorkspaceDir(workspace.id);
+      const appCtx = { owner: workspace.owner, presetId: workspace.preset_id };
       const result = await piManager.startOrSteer({
         owner: row.owner,
         projectId: row.id,
-        presetId: row.preset_id,
+        workspaceId: workspace.id,
+        presetId: workspace.preset_id,
         workspaceDir,
         userMessage: text,
         history: historyBefore,
         isInitialBuild: created || !hasWs,
-        onSettled: async (pid) => previewManager.restartApp(pid, appCtx, true),
+        onSettled: async (wsId) => previewManager.restartApp(wsId, appCtx, true),
       });
       res.json({
-        mode: 'build',
+        mode: result.mode === 'queued' ? 'queued' : 'build',
         userMessage: userMsg,
         runId: result.runId,
         messageId: result.messageId,
@@ -415,6 +761,7 @@ app.post('/api/projects/:id/abort', requireAuth, (req: AuthenticatedRequest, res
   res.json({ ok: aborted });
 });
 
+// Backwards-compatible project-scoped workspace endpoints (delegate to bound workspaceId)
 app.post('/api/projects/:id/workspace/init', requireAuth, async (req: AuthenticatedRequest, res) => {
   const row = assertOwnedProject(req, String(req.params.id));
   if (!row) {
@@ -422,12 +769,13 @@ app.post('/api/projects/:id/workspace/init', requireAuth, async (req: Authentica
     return;
   }
   try {
-    await previewManager.ensureWorkspace(row.id, row.preset_id);
-    const updated = dbStore.updateProject(row.id, { hasWorkspace: true });
-    const dto = enrichProject(updated || row)!;
+    const { workspace } = await ensureBoundWorkspaceForProject(row.id, row.owner, row.title, row.preset_id);
+    const updated = dbStore.getProject(row.id)!;
+    const dto = enrichProject(updated)!;
+    const wsDto = enrichWorkspace(workspace)!;
     eventBus.emit(row.id, { type: 'project_updated', project: dto });
     eventBus.emitUser(row.owner, { type: 'project_updated', project: dto });
-    res.json({ ok: true, project: dto });
+    res.json({ ok: true, project: dto, workspace: wsDto });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
@@ -439,13 +787,17 @@ app.get('/api/projects/:id/files', requireAuth, (req: AuthenticatedRequest, res)
     res.status(404).json({ error: 'Project not found' });
     return;
   }
-  res.json({ files: previewManager.listFiles(row.id) });
+  if (!row.workspace_id) {
+    res.json({ files: [] });
+    return;
+  }
+  res.json({ files: previewManager.listFiles(row.workspace_id) });
 });
 
 app.get('/api/projects/:id/file', requireAuth, (req: AuthenticatedRequest, res) => {
   const row = assertOwnedProject(req, String(req.params.id));
-  if (!row) {
-    res.status(404).json({ error: 'Project not found' });
+  if (!row || !row.workspace_id) {
+    res.status(404).json({ error: 'Workspace not found' });
     return;
   }
   const filePath = String(req.query.path || '');
@@ -454,7 +806,7 @@ app.get('/api/projects/:id/file', requireAuth, (req: AuthenticatedRequest, res) 
     return;
   }
   try {
-    res.json(previewManager.readFile(row.id, filePath));
+    res.json(previewManager.readFile(row.workspace_id, filePath));
   } catch (err) {
     res.status(404).json({ error: err instanceof Error ? err.message : 'File not found' });
   }
@@ -462,8 +814,8 @@ app.get('/api/projects/:id/file', requireAuth, (req: AuthenticatedRequest, res) 
 
 app.put('/api/projects/:id/file', requireAuth, (req: AuthenticatedRequest, res) => {
   const row = assertOwnedProject(req, String(req.params.id));
-  if (!row) {
-    res.status(404).json({ error: 'Project not found' });
+  if (!row || !row.workspace_id) {
+    res.status(404).json({ error: 'Workspace not found' });
     return;
   }
   const { path: filePath, content } = (req.body || {}) as { path?: string; content?: string };
@@ -472,7 +824,7 @@ app.put('/api/projects/:id/file', requireAuth, (req: AuthenticatedRequest, res) 
     return;
   }
   try {
-    const saved = previewManager.writeFile(row.id, filePath, content);
+    const saved = previewManager.writeFile(row.workspace_id, filePath, content);
     res.json({ ok: true, ...saved });
   } catch (err) {
     res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
@@ -481,8 +833,8 @@ app.put('/api/projects/:id/file', requireAuth, (req: AuthenticatedRequest, res) 
 
 app.post('/api/projects/:id/files/create', requireAuth, (req: AuthenticatedRequest, res) => {
   const row = assertOwnedProject(req, String(req.params.id));
-  if (!row) {
-    res.status(404).json({ error: 'Project not found' });
+  if (!row || !row.workspace_id) {
+    res.status(404).json({ error: 'Workspace not found' });
     return;
   }
   const { path: filePath, type } = (req.body || {}) as { path?: string; type?: 'file' | 'dir' };
@@ -491,7 +843,7 @@ app.post('/api/projects/:id/files/create', requireAuth, (req: AuthenticatedReque
     return;
   }
   try {
-    const created = previewManager.createEntry(row.id, filePath, type);
+    const created = previewManager.createEntry(row.workspace_id, filePath, type);
     res.status(201).json({ ok: true, ...created });
   } catch (err) {
     res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
@@ -500,8 +852,8 @@ app.post('/api/projects/:id/files/create', requireAuth, (req: AuthenticatedReque
 
 app.delete('/api/projects/:id/file', requireAuth, (req: AuthenticatedRequest, res) => {
   const row = assertOwnedProject(req, String(req.params.id));
-  if (!row) {
-    res.status(404).json({ error: 'Project not found' });
+  if (!row || !row.workspace_id) {
+    res.status(404).json({ error: 'Workspace not found' });
     return;
   }
   const filePath = String(req.query.path || '');
@@ -510,7 +862,7 @@ app.delete('/api/projects/:id/file', requireAuth, (req: AuthenticatedRequest, re
     return;
   }
   try {
-    const deleted = previewManager.deleteEntry(row.id, filePath);
+    const deleted = previewManager.deleteEntry(row.workspace_id, filePath);
     res.json({ ok: true, ...deleted });
   } catch (err) {
     res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
@@ -523,9 +875,10 @@ app.get('/api/projects/:id/tables', requireAuth, (req: AuthenticatedRequest, res
     res.status(404).json({ error: 'Project not found' });
     return;
   }
-  const prefix = buildTablePrefix(row.owner, row.id);
+  const targetId = row.workspace_id || row.id;
+  const prefix = buildTablePrefix(row.owner, targetId);
   const preset = pluginRegistry.listPresets().find((p) => p.id === row.preset_id);
-  const tables = dbProxy.listTables({ owner: row.owner, projectId: row.id, prefix });
+  const tables = dbProxy.listTables({ owner: row.owner, projectId: targetId, prefix });
   res.json({ prefix, preset, tables });
 });
 
@@ -535,10 +888,11 @@ app.get('/api/projects/:id/tables/:table/rows', requireAuth, (req: Authenticated
     res.status(404).json({ error: 'Project not found' });
     return;
   }
-  const prefix = buildTablePrefix(row.owner, row.id);
+  const targetId = row.workspace_id || row.id;
+  const prefix = buildTablePrefix(row.owner, targetId);
   try {
     const data = dbProxy.previewTableRows(
-      { owner: row.owner, projectId: row.id, prefix },
+      { owner: row.owner, projectId: targetId, prefix },
       String(req.params.table || ''),
       Number(req.query.limit || 30),
     );
@@ -554,22 +908,30 @@ app.get('/api/projects/:id/logs', requireAuth, (req: AuthenticatedRequest, res) 
     res.status(404).json({ error: 'Project not found' });
     return;
   }
-  res.json(previewManager.getLogs(row.owner, row.id));
+  const targetId = row.workspace_id || row.id;
+  res.json(previewManager.getLogs(row.owner, targetId));
 });
 
 app.post('/api/projects/:id/preview/restart', requireAuth, async (req: AuthenticatedRequest, res) => {
   const row = assertOwnedProject(req, String(req.params.id));
-  if (!row) {
-    res.status(404).json({ error: 'Project not found' });
+  if (!row || !row.workspace_id) {
+    res.status(404).json({ error: 'Workspace not found' });
+    return;
+  }
+  const ws = dbStore.getWorkspace(row.workspace_id);
+  if (!ws) {
+    res.status(404).json({ error: 'Workspace not found' });
     return;
   }
   try {
     const previewUrl = await previewManager.restartApp(
-      row.id,
-      { owner: row.owner, presetId: row.preset_id },
+      ws.id,
+      { owner: ws.owner, presetId: ws.preset_id },
       true,
     );
-    eventBus.emit(row.id, { type: 'preview_ready', projectId: row.id, previewUrl });
+    for (const proj of dbStore.listProjectsByWorkspace(ws.id)) {
+      eventBus.emit(proj.id, { type: 'preview_ready', projectId: proj.id, previewUrl });
+    }
     res.json({ ok: true, previewUrl });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
