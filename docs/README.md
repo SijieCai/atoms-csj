@@ -17,3 +17,4 @@
 | 日期 | 文档 | 核心主题 |
 |---|---|---|
 | 2026-11-25 | [`2026-11-25-project-switch-agent-state-loss.md`](./issues/2026-11-25-project-switch-agent-state-loss.md) | 多项目切换导致子 Agent 运行状态丢失与侧边栏同步修复（ActiveRun 快照 + SSE seq 去重 + 全局用户 SSE） |
+| 2026-11-25 | [`2026-11-25-duplicate-unbound-thread.md`](./issues/2026-11-25-duplicate-unbound-thread.md) | 新建对话首条消息时全局 SSE 与 HTTP 响应竞态导致侧边栏出现重复「未绑定对话」修复 |
