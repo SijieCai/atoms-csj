@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import type { AgentToolStep, MessageDTO, MessageMetadata } from '@atoms/shared';
+import type { ActiveRunSnapshot, AgentToolStep, MessageDTO, MessageMetadata } from '@atoms/shared';
 import { config, ensureDataDirs } from './config.js';
 import { dbStore, generateId, toProjectDTO } from './db.js';
 import { eventBus } from './event-bus.js';
@@ -105,9 +105,15 @@ function extractTextFromToolResult(result: unknown): string {
 
 interface ActiveRun {
   projectId: string;
+  owner: string;
   runId: string;
   messageId: string;
   child: ChildProcessWithoutNullStreams;
+  startedAt: number;
+  lastActivityAt: number;
+  lastActivityBroadcastAt: number;
+  statusText?: string;
+  lastSeq: number;
   assistantText: string;
   thinkingText: string;
   steps: AgentToolStep[];
@@ -118,6 +124,19 @@ interface ActiveRun {
   timeoutTimer: NodeJS.Timeout;
   reqSeq: number;
   onSettled: (projectId: string, ok: boolean) => Promise<string | null>;
+}
+
+function summarizeActiveStep(run: ActiveRun): string {
+  if (run.statusText) return run.statusText;
+  const runningStep = [...run.steps].reverse().find((s) => s.status === 'running');
+  if (runningStep) {
+    return runningStep.argsSummary
+      ? `${runningStep.toolName}: ${runningStep.argsSummary.slice(0, 60)}`
+      : `执行 ${runningStep.toolName}`;
+  }
+  if (run.assistantText.trim()) return '正在输出构建结果...';
+  if (run.thinkingText.trim()) return 'Agent 深度思考中...';
+  return 'Pi Coding Agent 运行中...';
 }
 
 class PiAgentManager {
@@ -139,6 +158,58 @@ class PiAgentManager {
     return this.activeRuns.size;
   }
 
+  getActiveRunSnapshot(projectId: string): ActiveRunSnapshot | null {
+    const run = this.activeRuns.get(projectId);
+    if (!run) return null;
+    return {
+      runId: run.runId,
+      messageId: run.messageId,
+      mode: 'build',
+      startedAt: run.startedAt,
+      lastActivityAt: run.lastActivityAt,
+      statusText: run.statusText,
+      thinking: run.thinkingText,
+      text: run.assistantText,
+      steps: run.steps.map((s) => ({ ...s })),
+      seq: run.lastSeq,
+    };
+  }
+
+  getActiveSummary(projectId: string): {
+    isBuilding: boolean;
+    activeStep: string | null;
+    startedAt: number | null;
+    lastActivityAt: number | null;
+  } {
+    const run = this.activeRuns.get(projectId);
+    if (!run) {
+      return { isBuilding: false, activeStep: null, startedAt: null, lastActivityAt: null };
+    }
+    return {
+      isBuilding: true,
+      activeStep: summarizeActiveStep(run),
+      startedAt: run.startedAt,
+      lastActivityAt: run.lastActivityAt,
+    };
+  }
+
+  private broadcastActivity(run: ActiveRun, force = false): void {
+    const now = Date.now();
+    if (!force && now - run.lastActivityBroadcastAt < 1800) {
+      return;
+    }
+    run.lastActivityBroadcastAt = now;
+    eventBus.emitUser(run.owner, {
+      type: 'project_activity',
+      projectId: run.projectId,
+      status: 'building',
+      isBuilding: true,
+      activeStep: summarizeActiveStep(run),
+      startedAt: run.startedAt,
+      lastActivityAt: run.lastActivityAt,
+    });
+  }
+
   async startOrSteer(params: {
     owner: string;
     projectId: string;
@@ -150,18 +221,25 @@ class PiAgentManager {
     onSettled: (projectId: string, ok: boolean) => Promise<string | null>;
   }): Promise<{ mode: 'started' | 'steered'; runId: string; messageId: string }> {
     const existing = this.activeRuns.get(params.projectId);
-    if (existing && !existing.settled) {
+    if (existing) {
+      if (existing.settled) {
+        throw new Error('上一轮构建正在收尾启动预览服务，请稍候几秒后再发新指令。');
+      }
       const cmdId = `steer-${++existing.reqSeq}`;
       this.writeRpc(existing.child, {
         id: cmdId,
         type: 'steer',
         message: params.userMessage,
       });
-      eventBus.emit(params.projectId, {
+      const statusText = '已收到你的补充指令，将在当前步骤完成后立即调整执行方向...';
+      existing.statusText = statusText;
+      existing.lastActivityAt = Date.now();
+      existing.lastSeq = eventBus.emit(params.projectId, {
         type: 'agent_status',
         messageId: existing.messageId,
-        statusText: '已收到你的补充指令，将在当前步骤完成后立即调整执行方向...',
+        statusText,
       });
+      this.broadcastActivity(existing, true);
       return { mode: 'steered', runId: existing.runId, messageId: existing.messageId };
     }
 
@@ -197,6 +275,7 @@ class PiAgentManager {
     ].join('\n');
     fs.writeFileSync(path.join(params.workspaceDir, 'PROJECT_CONTEXT.md'), contextMd, 'utf8');
 
+    const now = Date.now();
     const runId = dbStore.createAgentRun(params.projectId, params.userMessage);
     const messageId = generateId('msg');
     dbStore.addMessage(
@@ -207,21 +286,32 @@ class PiAgentManager {
       messageId,
     );
 
+    const initialStatus = '正在隔离工作区启动 Pi Coding Agent...';
     const updatedProj = dbStore.updateProject(params.projectId, {
       status: 'building',
       hasWorkspace: true,
     });
     if (updatedProj) {
+      const dto = {
+        ...toProjectDTO(updatedProj, false),
+        activeStep: initialStatus,
+        lastActivityAt: now,
+      };
       eventBus.emit(params.projectId, {
         type: 'project_updated',
-        project: toProjectDTO(updatedProj, false),
+        project: dto,
+      });
+      eventBus.emitUser(params.owner, {
+        type: 'project_updated',
+        project: dto,
       });
     }
 
-    eventBus.emit(params.projectId, {
+    const startSeq = eventBus.emit(params.projectId, {
       type: 'agent_start',
       runId,
       messageId,
+      startedAt: now,
     });
 
     const sanitizedEnv: NodeJS.ProcessEnv = {
@@ -264,9 +354,15 @@ class PiAgentManager {
 
     const run: ActiveRun = {
       projectId: params.projectId,
+      owner: params.owner,
       runId,
       messageId,
       child,
+      startedAt: now,
+      lastActivityAt: now,
+      lastActivityBroadcastAt: 0,
+      statusText: initialStatus,
+      lastSeq: startSeq,
       assistantText: '',
       thinkingText: '',
       steps: [],
@@ -279,11 +375,15 @@ class PiAgentManager {
       timeoutTimer: setTimeout(() => {
         if (!run.settled) {
           run.aborted = true;
-          eventBus.emit(params.projectId, {
+          const statusText = '构建超过最大耗时限制，正在终止任务...';
+          run.statusText = statusText;
+          run.lastActivityAt = Date.now();
+          run.lastSeq = eventBus.emit(params.projectId, {
             type: 'agent_status',
             messageId,
-            statusText: '构建超过最大耗时限制，正在终止任务...',
+            statusText,
           });
+          this.broadcastActivity(run, true);
           this.writeRpc(child, { id: `abort-timeout`, type: 'abort' });
           setTimeout(() => {
             if (!run.settled) child.kill('SIGKILL');
@@ -293,6 +393,7 @@ class PiAgentManager {
     };
 
     this.activeRuns.set(params.projectId, run);
+    this.broadcastActivity(run, true);
     this.attachSubprocessHandlers(run);
 
     const agentPrompt = params.isInitialBuild
@@ -312,11 +413,15 @@ class PiAgentManager {
     const run = this.activeRuns.get(projectId);
     if (!run || run.settled) return false;
     run.aborted = true;
-    eventBus.emit(projectId, {
+    const statusText = '正在停止当前构建任务...';
+    run.statusText = statusText;
+    run.lastActivityAt = Date.now();
+    run.lastSeq = eventBus.emit(projectId, {
       type: 'agent_status',
       messageId: run.messageId,
-      statusText: '正在停止当前构建任务...',
+      statusText,
     });
+    this.broadcastActivity(run, true);
     this.writeRpc(run.child, { id: `abort-${++run.reqSeq}`, type: 'abort' });
     setTimeout(() => {
       if (!run.settled) {
@@ -391,6 +496,7 @@ class PiAgentManager {
 
   private handleRpcRecord(run: ActiveRun, record: Record<string, unknown>): void {
     const type = String(record.type || '');
+    run.lastActivityAt = Date.now();
 
     if (type === 'response') {
       if (record.success === false) {
@@ -398,11 +504,14 @@ class PiAgentManager {
         if (record.command === 'prompt') {
           void this.finalizeRun(run, 'failed', err);
         } else {
-          eventBus.emit(run.projectId, {
+          const statusText = `指令提示: ${err}`;
+          run.statusText = statusText;
+          run.lastSeq = eventBus.emit(run.projectId, {
             type: 'agent_status',
             messageId: run.messageId,
-            statusText: `指令提示: ${err}`,
+            statusText,
           });
+          this.broadcastActivity(run, true);
         }
       }
       return;
@@ -427,18 +536,22 @@ class PiAgentManager {
 
       if (evtType === 'text_delta' && typeof evt.delta === 'string') {
         run.assistantText += evt.delta;
-        eventBus.emit(run.projectId, {
+        run.statusText = undefined;
+        run.lastSeq = eventBus.emit(run.projectId, {
           type: 'agent_text_delta',
           messageId: run.messageId,
           delta: evt.delta,
         });
+        this.broadcastActivity(run, false);
       } else if (evtType === 'thinking_delta' && typeof evt.delta === 'string') {
         run.thinkingText += evt.delta;
-        eventBus.emit(run.projectId, {
+        run.statusText = undefined;
+        run.lastSeq = eventBus.emit(run.projectId, {
           type: 'agent_thinking_delta',
           messageId: run.messageId,
           delta: evt.delta,
         });
+        this.broadcastActivity(run, false);
       } else if (evtType === 'toolcall_start') {
         const stepId = String(evt.id || `tc-${run.steps.length + 1}`);
         const toolName = String(evt.toolName || 'tool');
@@ -446,11 +559,13 @@ class PiAgentManager {
           const step: AgentToolStep = { id: stepId, toolName, status: 'running' };
           run.stepIndexById.set(stepId, run.steps.length);
           run.steps.push(step);
-          eventBus.emit(run.projectId, {
+          run.statusText = undefined;
+          run.lastSeq = eventBus.emit(run.projectId, {
             type: 'agent_tool_start',
             messageId: run.messageId,
-            step,
+            step: { ...step },
           });
+          this.broadcastActivity(run, true);
         }
       } else if (evtType === 'toolcall_end') {
         const tc = evt.toolCall as Record<string, unknown> | undefined;
@@ -460,11 +575,13 @@ class PiAgentManager {
           const toolName = String(tc.name || run.steps[idx].toolName);
           run.steps[idx].toolName = toolName;
           run.steps[idx].argsSummary = summarizeToolArgs(toolName, tc.arguments);
-          eventBus.emit(run.projectId, {
+          run.statusText = undefined;
+          run.lastSeq = eventBus.emit(run.projectId, {
             type: 'agent_tool_start',
             messageId: run.messageId,
-            step: run.steps[idx],
+            step: { ...run.steps[idx] },
           });
+          this.broadcastActivity(run, true);
         }
       } else if (evtType === 'error') {
         const err = typeof evt.error === 'string' ? evt.error : JSON.stringify(evt.error || 'Model stream error');
@@ -478,13 +595,14 @@ class PiAgentManager {
       const toolName = String(record.toolName || 'tool');
       const argsSummary = summarizeToolArgs(toolName, record.args);
       const existingIdx = run.stepIndexById.get(stepId);
+      run.statusText = undefined;
       if (existingIdx !== undefined) {
         run.steps[existingIdx].argsSummary = argsSummary || run.steps[existingIdx].argsSummary;
         run.steps[existingIdx].status = 'running';
-        eventBus.emit(run.projectId, {
+        run.lastSeq = eventBus.emit(run.projectId, {
           type: 'agent_tool_start',
           messageId: run.messageId,
-          step: run.steps[existingIdx],
+          step: { ...run.steps[existingIdx] },
         });
       } else {
         const step: AgentToolStep = {
@@ -495,12 +613,13 @@ class PiAgentManager {
         };
         run.stepIndexById.set(stepId, run.steps.length);
         run.steps.push(step);
-        eventBus.emit(run.projectId, {
+        run.lastSeq = eventBus.emit(run.projectId, {
           type: 'agent_tool_start',
           messageId: run.messageId,
-          step,
+          step: { ...step },
         });
       }
+      this.broadcastActivity(run, true);
       return;
     }
 
@@ -510,12 +629,13 @@ class PiAgentManager {
       const partial = extractTextFromToolResult(record.partialResult);
       if (idx !== undefined && partial) {
         run.steps[idx].output = partial;
-        eventBus.emit(run.projectId, {
+        run.lastSeq = eventBus.emit(run.projectId, {
           type: 'agent_tool_update',
           messageId: run.messageId,
           stepId,
           outputDelta: partial,
         });
+        this.broadcastActivity(run, false);
       }
       return;
     }
@@ -528,13 +648,14 @@ class PiAgentManager {
       if (idx !== undefined) {
         run.steps[idx].status = isError ? 'error' : 'done';
         if (output) run.steps[idx].output = output;
-        eventBus.emit(run.projectId, {
+        run.lastSeq = eventBus.emit(run.projectId, {
           type: 'agent_tool_end',
           messageId: run.messageId,
           stepId,
           status: run.steps[idx].status,
           output,
         });
+        this.broadcastActivity(run, true);
       }
       return;
     }
@@ -543,12 +664,13 @@ class PiAgentManager {
       const lastRunning = [...run.steps].reverse().find((s) => s.status === 'running');
       if (lastRunning) {
         lastRunning.output = `${lastRunning.output || ''}${record.chunk}`.slice(-1200);
-        eventBus.emit(run.projectId, {
+        run.lastSeq = eventBus.emit(run.projectId, {
           type: 'agent_tool_update',
           messageId: run.messageId,
           stepId: lastRunning.id,
           outputDelta: lastRunning.output,
         });
+        this.broadcastActivity(run, false);
       }
       return;
     }
@@ -567,7 +689,6 @@ class PiAgentManager {
     if (run.settled) return;
     run.settled = true;
     clearTimeout(run.timeoutTimer);
-    this.activeRuns.delete(run.projectId);
 
     // Gracefully terminate the per-run Pi RPC subprocess (session state is persisted in .pi-sessions)
     try {
@@ -579,13 +700,18 @@ class PiAgentManager {
       // ignore
     }
 
+    // Keep run in activeRuns while preview builds & starts so switching projects during finalization never sees a blank gap
     let previewUrl: string | null = null;
     if (status === 'succeeded') {
-      eventBus.emit(run.projectId, {
+      const statusText = '代码已完成，正在启动全栈应用与 SQLite 数据库预览服务...';
+      run.statusText = statusText;
+      run.lastActivityAt = Date.now();
+      run.lastSeq = eventBus.emit(run.projectId, {
         type: 'agent_status',
         messageId: run.messageId,
-        statusText: '代码已完成，正在启动全栈应用与 SQLite 数据库预览服务...',
+        statusText,
       });
+      this.broadcastActivity(run, true);
       try {
         previewUrl = await run.onSettled(run.projectId, true);
       } catch (err) {
@@ -623,10 +749,22 @@ class PiAgentManager {
       status: projectStatus,
       hasWorkspace: true,
     });
-    if (updatedProj) {
+
+    // Remove from activeRuns AFTER DB persistence so any client fetching GET /api/projects/:id sees the final message cleanly
+    this.activeRuns.delete(run.projectId);
+
+    const updatedDto = updatedProj
+      ? {
+          ...toProjectDTO(updatedProj, Boolean(previewUrl)),
+          activeStep: null,
+          lastActivityAt: null,
+        }
+      : null;
+
+    if (updatedDto) {
       eventBus.emit(run.projectId, {
         type: 'project_updated',
-        project: toProjectDTO(updatedProj, Boolean(previewUrl)),
+        project: updatedDto,
       });
     }
 
@@ -645,6 +783,15 @@ class PiAgentManager {
       status,
       error,
     });
+
+    if (updatedDto) {
+      eventBus.emitUser(run.owner, {
+        type: 'project_run_finished',
+        projectId: run.projectId,
+        status,
+        project: updatedDto,
+      });
+    }
   }
 }
 

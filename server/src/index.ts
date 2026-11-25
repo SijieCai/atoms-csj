@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import express from 'express';
 import cookieParser from 'cookie-parser';
-import type { ProjectDTO } from '@atoms/shared';
+import type { ActiveRunSnapshot, ProjectDTO } from '@atoms/shared';
 import { config, ensureDataDirs } from './config.js';
 import { dbStore, generateId, toProjectDTO } from './db.js';
 import { buildTablePrefix, createDbProxyRouter, dbProxy } from './db-proxy.js';
@@ -23,6 +23,21 @@ import { lspManager } from './lsp-manager.js';
 
 ensureDataDirs();
 pluginRegistry.reload();
+const recoveredStale = dbStore.recoverStaleBuildingProjects();
+if (recoveredStale.length > 0) {
+  console.log(
+    `[atoms-server] Recovered ${recoveredStale.length} stale building project(s): ${recoveredStale.map((r) => r.id).join(', ')}`,
+  );
+}
+
+const activeChatRuns = new Map<string, ActiveRunSnapshot>();
+
+function getActiveRunSnapshot(projectId: string): ActiveRunSnapshot | null {
+  const buildSnap = piManager.getActiveRunSnapshot(projectId);
+  if (buildSnap) return buildSnap;
+  const chatSnap = activeChatRuns.get(projectId);
+  return chatSnap ? { ...chatSnap, steps: [] } : null;
+}
 
 const app = express();
 app.set('trust proxy', 1);
@@ -123,7 +138,23 @@ function enrichProject(row: ReturnType<typeof dbStore.getProject>): ProjectDTO |
   if (!row) return null;
   const hasWs = Boolean(row.has_workspace) || previewManager.hasWorkspace(row.id);
   const effectiveRow = hasWs !== Boolean(row.has_workspace) ? { ...row, has_workspace: 1 } : row;
-  return toProjectDTO(effectiveRow, previewManager.isRunning(row.id));
+  const summary = piManager.getActiveSummary(row.id);
+  const chatSnap = activeChatRuns.get(row.id);
+  const base = toProjectDTO(effectiveRow, previewManager.isRunning(row.id));
+  return {
+    ...base,
+    status: summary.isBuilding ? 'building' : base.status,
+    activeStep: summary.isBuilding
+      ? summary.activeStep
+      : chatSnap
+        ? 'AI 正在回复...'
+        : null,
+    lastActivityAt: summary.isBuilding
+      ? summary.lastActivityAt
+      : chatSnap
+        ? chatSnap.lastActivityAt
+        : null,
+  };
 }
 
 function assertOwnedProject(req: AuthenticatedRequest, projectId: string) {
@@ -133,6 +164,23 @@ function assertOwnedProject(req: AuthenticatedRequest, projectId: string) {
   }
   return row;
 }
+
+// User-level global SSE stream for real-time cross-project sidebar status & notifications
+app.get('/api/events', requireAuth, (req: AuthenticatedRequest, res) => {
+  const username = req.user!.username;
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders?.();
+
+  const unsubscribe = eventBus.subscribeUser(username, res);
+  res.write(`data: ${JSON.stringify({ type: 'user_connected', username })}\n\n`);
+
+  req.on('close', () => {
+    unsubscribe();
+  });
+});
 
 app.get('/api/projects', requireAuth, (req: AuthenticatedRequest, res) => {
   const rows = dbStore.listProjects(req.user!.username);
@@ -149,7 +197,9 @@ app.post('/api/projects', requireAuth, (req: AuthenticatedRequest, res) => {
     (title || '新对话').trim().slice(0, 40),
     resolvedPreset,
   );
-  res.status(201).json({ project: enrichProject(row) });
+  const dto = enrichProject(row)!;
+  eventBus.emitUser(req.user!.username, { type: 'project_updated', project: dto });
+  res.status(201).json({ project: dto });
 });
 
 app.get('/api/projects/:id', requireAuth, (req: AuthenticatedRequest, res) => {
@@ -163,6 +213,7 @@ app.get('/api/projects/:id', requireAuth, (req: AuthenticatedRequest, res) => {
     project: enrichProject(row),
     messages,
     isBuilding: piManager.isRunning(row.id),
+    activeRun: getActiveRunSnapshot(row.id),
   });
 });
 
@@ -172,9 +223,11 @@ app.delete('/api/projects/:id', requireAuth, (req: AuthenticatedRequest, res) =>
     res.status(404).json({ error: 'Project not found' });
     return;
   }
+  activeChatRuns.delete(row.id);
   piManager.abort(row.id);
   previewManager.deleteWorkspace(row.owner, row.id);
   dbStore.deleteProject(row.id);
+  eventBus.emitUser(row.owner, { type: 'project_deleted', projectId: row.id });
   res.json({ ok: true });
 });
 
@@ -197,6 +250,9 @@ app.get('/api/projects/:id/events', requireAuth, (req: AuthenticatedRequest, res
       type: 'connected',
       projectId: row.id,
       isBuilding: piManager.isRunning(row.id),
+      activeRun: getActiveRunSnapshot(row.id),
+      seq: eventBus.getSeq(row.id),
+      ts: Date.now(),
     })}\n\n`,
   );
 
@@ -256,7 +312,9 @@ app.post('/api/projects/:id/messages', requireAuth, async (req: AuthenticatedReq
     const newTitle = decision.title || deriveFallbackTitle(text);
     const updated = dbStore.updateProject(row.id, { title: newTitle });
     if (updated) {
-      eventBus.emit(row.id, { type: 'project_updated', project: enrichProject(updated)! });
+      const dto = enrichProject(updated)!;
+      eventBus.emit(row.id, { type: 'project_updated', project: dto });
+      eventBus.emitUser(row.owner, { type: 'project_updated', project: dto });
     }
   }
 
@@ -295,12 +353,36 @@ app.post('/api/projects/:id/messages', requireAuth, async (req: AuthenticatedReq
   res.json({ mode: 'chat', userMessage: userMsg, messageId: assistantMsgId });
 
   void (async () => {
-    eventBus.emit(row.id, { type: 'chat_start', messageId: assistantMsgId });
+    const startedAt = Date.now();
+    const startSeq = eventBus.emit(row.id, { type: 'chat_start', messageId: assistantMsgId, startedAt });
+    const chatRun: ActiveRunSnapshot = {
+      messageId: assistantMsgId,
+      mode: 'chat',
+      startedAt,
+      lastActivityAt: startedAt,
+      thinking: '',
+      text: '',
+      steps: [],
+      seq: startSeq,
+    };
+    activeChatRuns.set(row.id, chatRun);
+    eventBus.emitUser(row.owner, {
+      type: 'project_activity',
+      projectId: row.id,
+      status: row.status,
+      isBuilding: false,
+      activeStep: 'AI 正在回复...',
+      startedAt,
+      lastActivityAt: startedAt,
+    });
     try {
       const { text: replyText, suggestBuild } = await streamChatReply(historyBefore, text, (delta) => {
-        eventBus.emit(row.id, { type: 'chat_delta', messageId: assistantMsgId, delta });
+        chatRun.text += delta;
+        chatRun.lastActivityAt = Date.now();
+        chatRun.seq = eventBus.emit(row.id, { type: 'chat_delta', messageId: assistantMsgId, delta });
       });
       const saved = dbStore.addMessage(row.id, 'assistant', replyText, { mode: 'chat' }, assistantMsgId);
+      activeChatRuns.delete(row.id);
       eventBus.emit(row.id, { type: 'chat_done', message: saved, suggestBuild });
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -311,7 +393,14 @@ app.post('/api/projects/:id/messages', requireAuth, async (req: AuthenticatedReq
         { mode: 'chat', error: errMsg },
         assistantMsgId,
       );
+      activeChatRuns.delete(row.id);
       eventBus.emit(row.id, { type: 'chat_done', message: saved, suggestBuild: false });
+    } finally {
+      activeChatRuns.delete(row.id);
+      const latest = dbStore.getProject(row.id);
+      if (latest) {
+        eventBus.emitUser(row.owner, { type: 'project_updated', project: enrichProject(latest)! });
+      }
     }
   })();
 });
@@ -337,6 +426,7 @@ app.post('/api/projects/:id/workspace/init', requireAuth, async (req: Authentica
     const updated = dbStore.updateProject(row.id, { hasWorkspace: true });
     const dto = enrichProject(updated || row)!;
     eventBus.emit(row.id, { type: 'project_updated', project: dto });
+    eventBus.emitUser(row.owner, { type: 'project_updated', project: dto });
     res.json({ ok: true, project: dto });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });

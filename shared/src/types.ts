@@ -52,6 +52,19 @@ export interface TableInfoDTO {
   sql: string;
 }
 
+export interface ActiveRunSnapshot {
+  runId?: string;
+  messageId: string;
+  mode: 'chat' | 'build';
+  startedAt: number;
+  lastActivityAt: number;
+  statusText?: string;
+  thinking: string;
+  text: string;
+  steps: AgentToolStep[];
+  seq: number;
+}
+
 export interface ProjectDTO {
   id: string;
   owner: string;
@@ -62,6 +75,8 @@ export interface ProjectDTO {
   hasWorkspace: boolean;
   previewUrl: string | null;
   previewRunning: boolean;
+  activeStep?: string | null;
+  lastActivityAt?: number | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -82,14 +97,14 @@ export interface FileTreeNode {
   children?: FileTreeNode[];
 }
 
-export type SSEEvent =
-  | { type: 'connected'; projectId: string; isBuilding: boolean }
+export type SSEEventPayload =
+  | { type: 'connected'; projectId: string; isBuilding: boolean; activeRun: ActiveRunSnapshot | null }
   | { type: 'project_updated'; project: ProjectDTO }
   | { type: 'message_created'; message: MessageDTO }
-  | { type: 'chat_start'; messageId: string }
+  | { type: 'chat_start'; messageId: string; startedAt?: number }
   | { type: 'chat_delta'; messageId: string; delta: string }
   | { type: 'chat_done'; message: MessageDTO; suggestBuild?: boolean }
-  | { type: 'agent_start'; runId: string; messageId: string }
+  | { type: 'agent_start'; runId: string; messageId: string; startedAt?: number }
   | { type: 'agent_thinking_delta'; messageId: string; delta: string }
   | { type: 'agent_text_delta'; messageId: string; delta: string }
   | { type: 'agent_tool_start'; messageId: string; step: AgentToolStep }
@@ -99,3 +114,28 @@ export type SSEEvent =
   | { type: 'preview_ready'; projectId: string; previewUrl: string }
   | { type: 'agent_done'; runId: string; message: MessageDTO; status: 'succeeded' | 'aborted' | 'failed'; error?: string }
   | { type: 'error'; message: string };
+
+export type SSEEvent = SSEEventPayload & {
+  seq?: number;
+  ts?: number;
+};
+
+export type UserGlobalSSEEvent =
+  | { type: 'user_connected'; username: string }
+  | { type: 'project_updated'; project: ProjectDTO }
+  | {
+      type: 'project_activity';
+      projectId: string;
+      status: ProjectStatus;
+      isBuilding: boolean;
+      activeStep?: string | null;
+      startedAt?: number | null;
+      lastActivityAt?: number | null;
+    }
+  | {
+      type: 'project_run_finished';
+      projectId: string;
+      status: 'succeeded' | 'aborted' | 'failed';
+      project: ProjectDTO;
+    }
+  | { type: 'project_deleted'; projectId: string };

@@ -1,4 +1,5 @@
 import type {
+  ActiveRunSnapshot,
   AgentPresetSummary,
   FileTreeNode,
   MessageDTO,
@@ -56,7 +57,12 @@ export const api = {
     });
   },
 
-  getProject(id: string): Promise<{ project: ProjectDTO; messages: MessageDTO[]; isBuilding: boolean }> {
+  getProject(id: string): Promise<{
+    project: ProjectDTO;
+    messages: MessageDTO[];
+    isBuilding: boolean;
+    activeRun: ActiveRunSnapshot | null;
+  }> {
     return request(`/api/projects/${encodeURIComponent(id)}`);
   },
 

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   ChevronDown,
   ChevronRight,
@@ -18,6 +18,22 @@ interface AgentStepCardProps {
   steps?: AgentToolStep[];
   statusText?: string;
   isRunning?: boolean;
+  startedAt?: number;
+  lastActivityAt?: number;
+}
+
+function formatDuration(ms: number): string {
+  const totalSec = Math.max(0, Math.floor(ms / 1000));
+  const mins = Math.floor(totalSec / 60);
+  const secs = totalSec % 60;
+  return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+}
+
+function formatAgo(ms: number): string {
+  const sec = Math.max(0, Math.floor(ms / 1000));
+  if (sec <= 2) return '刚刚活跃';
+  if (sec < 60) return `${sec} 秒前活跃`;
+  return `${Math.floor(sec / 60)} 分钟前活跃`;
 }
 
 function ToolIcon({ name }: { name: string }) {
@@ -39,13 +55,27 @@ export const AgentStepCard: React.FC<AgentStepCardProps> = ({
   steps = [],
   statusText,
   isRunning,
+  startedAt,
+  lastActivityAt,
 }) => {
   const [showThinking, setShowThinking] = useState(false);
   const [expandedStepId, setExpandedStepId] = useState<string | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!isRunning) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [isRunning]);
 
   if (!thinking && steps.length === 0 && !statusText && !isRunning) {
     return null;
   }
+
+  const idleMs = lastActivityAt ? Math.max(0, now - lastActivityAt) : 0;
+  const elapsedMs = startedAt ? Math.max(0, now - startedAt) : 0;
+  const isRecentlyActive = idleMs < 20_000;
 
   return (
     <div className="mb-3 space-y-2">
@@ -114,9 +144,26 @@ export const AgentStepCard: React.FC<AgentStepCardProps> = ({
       )}
 
       {(statusText || isRunning) && (
-        <div className="flex items-center gap-2 text-xs text-indigo-700 bg-indigo-50 border border-indigo-100 rounded-lg px-3 py-1.5">
-          {isRunning && <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />}
-          <span>{statusText || 'Pi Coding Agent 正在隔离工作区开发与编译...'}</span>
+        <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-indigo-700 bg-indigo-50 border border-indigo-100 rounded-lg px-3 py-1.5">
+          <div className="flex items-center gap-2 min-w-0">
+            {isRunning && <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />}
+            <span className="truncate">{statusText || 'Pi Coding Agent 正在隔离工作区开发与编译...'}</span>
+          </div>
+          {isRunning && (startedAt || lastActivityAt) && (
+            <div className="flex items-center gap-2 text-[11px] text-indigo-600/80 shrink-0 font-mono">
+              {startedAt && <span>已耗时 {formatDuration(elapsedMs)}</span>}
+              {lastActivityAt && (
+                <span className="inline-flex items-center gap-1">
+                  <span
+                    className={`w-1.5 h-1.5 rounded-full ${
+                      isRecentlyActive ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'
+                    }`}
+                  />
+                  {formatAgo(idleMs)}
+                </span>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>

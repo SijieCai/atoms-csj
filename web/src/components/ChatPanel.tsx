@@ -20,6 +20,9 @@ export interface LiveStreamState {
   thinking: string;
   steps: AgentToolStep[];
   statusText?: string;
+  startedAt?: number;
+  lastActivityAt?: number;
+  seq?: number;
 }
 
 interface ChatPanelProps {
@@ -99,12 +102,13 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
           <h2 className="text-sm font-semibold text-slate-900 truncate">
             {project ? project.title : '新对话'}
           </h2>
-          {project?.status === 'building' && (
-            <span className="inline-flex items-center gap-1 text-[11px] font-medium px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200">
+          {(project?.status === 'building' || isBuilding) && (
+            <span className="inline-flex items-center gap-1.5 text-[11px] font-medium px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200">
+              <span className="w-1.5 h-1.5 rounded-full bg-indigo-600 animate-ping" />
               Agent 开发中
             </span>
           )}
-          {project?.hasWorkspace && project.status !== 'building' && (
+          {project?.hasWorkspace && project.status !== 'building' && !isBuilding && (
             <span className="inline-flex items-center gap-1 text-[11px] font-medium px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">
               <Database className="w-3 h-3" />
               全栈已就绪
@@ -236,6 +240,8 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                       steps={liveStream.steps}
                       statusText={liveStream.statusText}
                       isRunning={true}
+                      startedAt={liveStream.startedAt}
+                      lastActivityAt={liveStream.lastActivityAt}
                     />
                   )}
                   <div className="whitespace-pre-wrap break-words">

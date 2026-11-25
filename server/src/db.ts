@@ -255,4 +255,34 @@ export const dbStore = {
       WHERE id = ?
     `).run(status, Date.now(), error ?? null, runId);
   },
+
+  recoverStaleBuildingProjects(): ProjectRow[] {
+    const now = Date.now();
+    db.prepare(`
+      UPDATE agent_runs
+      SET status = 'aborted', finished_at = ?, error = '服务端重启，上次构建任务已中断'
+      WHERE status = 'running'
+    `).run(now);
+
+    const stale = db
+      .prepare(`
+        SELECT id, owner, title, preset_id, status, has_workspace, created_at, updated_at
+        FROM projects
+        WHERE status = 'building'
+      `)
+      .all() as unknown as ProjectRow[];
+
+    for (const row of stale) {
+      const nextStatus: ProjectStatus = row.has_workspace ? 'ready' : 'error';
+      db.prepare(`UPDATE projects SET status = ?, updated_at = ? WHERE id = ?`).run(nextStatus, now, row.id);
+      this.addMessage(
+        row.id,
+        'assistant',
+        '服务端已重启，上次中断的构建任务状态已自动恢复。你可以继续对话或重新发起构建。',
+        { mode: 'build', aborted: true },
+      );
+    }
+
+    return stale;
+  },
 };

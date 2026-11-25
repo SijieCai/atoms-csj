@@ -15,6 +15,7 @@ interface SidebarProps {
   username: string;
   projects: ProjectDTO[];
   activeProjectId: string | null;
+  unreadCompletions: Record<string, 'succeeded' | 'aborted' | 'failed'>;
   onSelectProject: (id: string) => void;
   onNewChat: () => void;
   onDeleteProject: (id: string) => void;
@@ -23,7 +24,7 @@ interface SidebarProps {
 
 function StatusDot({ status }: { status: ProjectDTO['status'] }) {
   if (status === 'building') {
-    return <Loader2 className="w-3.5 h-3.5 text-indigo-500 animate-spin shrink-0" />;
+    return <Loader2 className="w-3.5 h-3.5 text-indigo-400 animate-spin shrink-0" />;
   }
   if (status === 'ready') {
     return <Globe className="w-3.5 h-3.5 text-emerald-500 shrink-0" />;
@@ -38,6 +39,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   username,
   projects,
   activeProjectId,
+  unreadCompletions,
   onSelectProject,
   onNewChat,
   onDeleteProject,
@@ -76,18 +78,42 @@ export const Sidebar: React.FC<SidebarProps> = ({
         ) : (
           projects.map((p) => {
             const active = p.id === activeProjectId;
+            const unread = unreadCompletions[p.id];
+            const isWorking = p.status === 'building' || Boolean(p.activeStep);
             return (
               <div
                 key={p.id}
                 onClick={() => onSelectProject(p.id)}
-                className={`group flex items-center gap-2 px-2.5 py-2 rounded-lg text-xs cursor-pointer transition ${
+                className={`group flex items-start gap-2 px-2.5 py-2 rounded-lg text-xs cursor-pointer transition ${
                   active
                     ? 'bg-slate-800 text-white font-medium'
                     : 'text-slate-300 hover:bg-slate-800/60 hover:text-white'
                 }`}
               >
-                <StatusDot status={p.status} />
-                <span className="flex-1 truncate">{p.title}</span>
+                <div className="mt-0.5">
+                  <StatusDot status={p.status} />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-1.5">
+                    <span className="flex-1 truncate">{p.title}</span>
+                    {!active && unread === 'succeeded' && (
+                      <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-medium">
+                        已完成
+                      </span>
+                    )}
+                    {!active && unread === 'failed' && (
+                      <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-300 border border-rose-500/30 font-medium">
+                        出错
+                      </span>
+                    )}
+                  </div>
+                  {isWorking && (
+                    <div className="mt-0.5 flex items-center gap-1.5 text-[10px] text-indigo-300 truncate">
+                      <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse shrink-0" />
+                      <span className="truncate">{p.activeStep || 'Agent 运行中...'}</span>
+                    </div>
+                  )}
+                </div>
                 <button
                   type="button"
                   title="删除项目"
@@ -95,7 +121,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                     e.stopPropagation();
                     onDeleteProject(p.id);
                   }}
-                  className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-slate-700 text-slate-400 hover:text-rose-400 transition cursor-pointer"
+                  className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-slate-700 text-slate-400 hover:text-rose-400 transition cursor-pointer shrink-0"
                 >
                   <Trash2 className="w-3.5 h-3.5" />
                 </button>

@@ -1,10 +1,31 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import type { MessageDTO, ProjectDTO, SSEEvent } from '@atoms/shared';
+import type {
+  ActiveRunSnapshot,
+  MessageDTO,
+  ProjectDTO,
+  SSEEvent,
+  UserGlobalSSEEvent,
+} from '@atoms/shared';
 import { api } from './api';
 import { LoginPage } from './components/LoginPage';
 import { Sidebar } from './components/Sidebar';
 import { ChatPanel, type LiveStreamState } from './components/ChatPanel';
 import { WorkspacePanel } from './components/WorkspacePanel';
+
+function snapshotToLiveStream(snapshot: ActiveRunSnapshot | null | undefined): LiveStreamState | null {
+  if (!snapshot) return null;
+  return {
+    messageId: snapshot.messageId,
+    mode: snapshot.mode,
+    text: snapshot.text,
+    thinking: snapshot.thinking,
+    steps: snapshot.steps.map((s) => ({ ...s })),
+    statusText: snapshot.statusText,
+    startedAt: snapshot.startedAt,
+    lastActivityAt: snapshot.lastActivityAt,
+    seq: snapshot.seq,
+  };
+}
 
 export default function App() {
   const [authChecked, setAuthChecked] = useState(false);
@@ -18,10 +39,19 @@ export default function App() {
   const [suggestBuild, setSuggestBuild] = useState(false);
   const [liveStream, setLiveStream] = useState<LiveStreamState | null>(null);
   const [previewRevision, setPreviewRevision] = useState(0);
+  const [unreadCompletions, setUnreadCompletions] = useState<
+    Record<string, 'succeeded' | 'aborted' | 'failed'>
+  >({});
 
   const eventSourceRef = useRef<EventSource | null>(null);
+  const userEventSourceRef = useRef<EventSource | null>(null);
   const activeProjectIdRef = useRef<string | null>(null);
+  const selectSeqRef = useRef(0);
+  const lastStreamSeqRef = useRef(0);
+  const liveStreamRef = useRef<LiveStreamState | null>(null);
+
   activeProjectIdRef.current = activeProjectId;
+  liveStreamRef.current = liveStream;
 
   const activeProject = projects.find((p) => p.id === activeProjectId) || null;
 
@@ -46,6 +76,82 @@ export default function App() {
         setAuthChecked(true);
       });
   }, [refreshProjects]);
+
+  // Persistent user-level SSE for real-time sidebar sync across ALL projects
+  useEffect(() => {
+    if (!username) {
+      if (userEventSourceRef.current) {
+        userEventSourceRef.current.close();
+        userEventSourceRef.current = null;
+      }
+      return;
+    }
+
+    const es = new EventSource('/api/events', { withCredentials: true });
+    userEventSourceRef.current = es;
+
+    es.onmessage = (evt) => {
+      let parsed: UserGlobalSSEEvent;
+      try {
+        parsed = JSON.parse(evt.data) as UserGlobalSSEEvent;
+      } catch {
+        return;
+      }
+
+      switch (parsed.type) {
+        case 'project_updated':
+          setProjects((prev) => {
+            const exists = prev.some((p) => p.id === parsed.project.id);
+            if (!exists) return [parsed.project, ...prev];
+            return prev.map((p) => (p.id === parsed.project.id ? parsed.project : p));
+          });
+          break;
+
+        case 'project_activity':
+          setProjects((prev) =>
+            prev.map((p) =>
+              p.id === parsed.projectId
+                ? {
+                    ...p,
+                    status: parsed.status,
+                    activeStep: parsed.activeStep ?? null,
+                    lastActivityAt: parsed.lastActivityAt ?? p.lastActivityAt,
+                  }
+                : p,
+            ),
+          );
+          break;
+
+        case 'project_run_finished':
+          setProjects((prev) => {
+            const exists = prev.some((p) => p.id === parsed.project.id);
+            if (!exists) return [parsed.project, ...prev];
+            return prev.map((p) => (p.id === parsed.project.id ? parsed.project : p));
+          });
+          if (parsed.projectId !== activeProjectIdRef.current) {
+            setUnreadCompletions((prev) => ({ ...prev, [parsed.projectId]: parsed.status }));
+          }
+          break;
+
+        case 'project_deleted':
+          setProjects((prev) => prev.filter((p) => p.id !== parsed.projectId));
+          setUnreadCompletions((prev) => {
+            if (!(parsed.projectId in prev)) return prev;
+            const next = { ...prev };
+            delete next[parsed.projectId];
+            return next;
+          });
+          break;
+      }
+    };
+
+    return () => {
+      es.close();
+      if (userEventSourceRef.current === es) {
+        userEventSourceRef.current = null;
+      }
+    };
+  }, [username]);
 
   const closeStream = useCallback(() => {
     if (eventSourceRef.current) {
@@ -86,13 +192,51 @@ export default function App() {
             return;
           }
 
-          switch (parsed.type) {
-            case 'connected':
-              setIsBuilding(parsed.isBuilding);
-              clearTimeout(fallbackTimer);
-              done();
-              break;
+          if (parsed.type === 'connected') {
+            setIsBuilding(parsed.isBuilding);
+            if (parsed.activeRun) {
+              const snap = snapshotToLiveStream(parsed.activeRun);
+              lastStreamSeqRef.current = Math.max(lastStreamSeqRef.current, parsed.activeRun.seq);
+              setLiveStream((prev) => {
+                if (!snap) return prev;
+                // Only replace if no current stream, different messageId, or snapshot is newer
+                if (!prev || prev.messageId !== snap.messageId || (snap.seq ?? 0) >= (prev.seq ?? 0)) {
+                  return snap;
+                }
+                return prev;
+              });
+            } else if (liveStreamRef.current) {
+              // Run finished while reconnecting — fetch latest persisted messages so final output isn't missed
+              setLiveStream(null);
+              void api
+                .getProject(projectId)
+                .then((detail) => {
+                  if (activeProjectIdRef.current !== projectId) return;
+                  setMessages(detail.messages);
+                  setIsBuilding(detail.isBuilding);
+                  setProjects((prev) =>
+                    prev.map((p) => (p.id === detail.project.id ? detail.project : p)),
+                  );
+                })
+                .catch(() => {});
+            }
+            clearTimeout(fallbackTimer);
+            done();
+            return;
+          }
 
+          // Strict per-project seq deduplication so snapshot + live deltas never double-append
+          if (typeof parsed.seq === 'number') {
+            if (parsed.seq <= lastStreamSeqRef.current) {
+              return;
+            }
+            lastStreamSeqRef.current = parsed.seq;
+          }
+
+          const nowTs = parsed.ts || Date.now();
+          const seq = parsed.seq;
+
+          switch (parsed.type) {
             case 'project_updated':
               setProjects((prev) => {
                 const exists = prev.some((p) => p.id === parsed.project.id);
@@ -115,15 +259,33 @@ export default function App() {
                 text: '',
                 thinking: '',
                 steps: [],
+                startedAt: parsed.startedAt || nowTs,
+                lastActivityAt: nowTs,
+                seq,
               });
               break;
 
             case 'chat_delta':
-              setLiveStream((prev) =>
-                prev && prev.messageId === parsed.messageId
-                  ? { ...prev, text: prev.text + parsed.delta }
-                  : prev,
-              );
+              setLiveStream((prev) => {
+                if (!prev || prev.messageId !== parsed.messageId) {
+                  return {
+                    messageId: parsed.messageId,
+                    mode: 'chat',
+                    text: parsed.delta,
+                    thinking: '',
+                    steps: [],
+                    startedAt: nowTs,
+                    lastActivityAt: nowTs,
+                    seq,
+                  };
+                }
+                return {
+                  ...prev,
+                  text: prev.text + parsed.delta,
+                  lastActivityAt: nowTs,
+                  seq,
+                };
+              });
               break;
 
             case 'chat_done':
@@ -145,34 +307,88 @@ export default function App() {
                 thinking: '',
                 steps: [],
                 statusText: '正在隔离工作区启动 Pi Coding Agent...',
+                startedAt: parsed.startedAt || nowTs,
+                lastActivityAt: nowTs,
+                seq,
               });
               break;
 
             case 'agent_thinking_delta':
-              setLiveStream((prev) =>
-                prev && prev.messageId === parsed.messageId
-                  ? { ...prev, thinking: prev.thinking + parsed.delta }
-                  : prev,
-              );
+              setIsBuilding(true);
+              setLiveStream((prev) => {
+                if (!prev || prev.messageId !== parsed.messageId) {
+                  return {
+                    messageId: parsed.messageId,
+                    mode: 'build',
+                    text: '',
+                    thinking: parsed.delta,
+                    steps: [],
+                    startedAt: nowTs,
+                    lastActivityAt: nowTs,
+                    seq,
+                  };
+                }
+                return {
+                  ...prev,
+                  thinking: prev.thinking + parsed.delta,
+                  statusText: undefined,
+                  lastActivityAt: nowTs,
+                  seq,
+                };
+              });
               break;
 
             case 'agent_text_delta':
-              setLiveStream((prev) =>
-                prev && prev.messageId === parsed.messageId
-                  ? { ...prev, text: prev.text + parsed.delta }
-                  : prev,
-              );
+              setIsBuilding(true);
+              setLiveStream((prev) => {
+                if (!prev || prev.messageId !== parsed.messageId) {
+                  return {
+                    messageId: parsed.messageId,
+                    mode: 'build',
+                    text: parsed.delta,
+                    thinking: '',
+                    steps: [],
+                    startedAt: nowTs,
+                    lastActivityAt: nowTs,
+                    seq,
+                  };
+                }
+                return {
+                  ...prev,
+                  text: prev.text + parsed.delta,
+                  statusText: undefined,
+                  lastActivityAt: nowTs,
+                  seq,
+                };
+              });
               break;
 
             case 'agent_tool_start':
+              setIsBuilding(true);
               setLiveStream((prev) => {
-                if (!prev || prev.messageId !== parsed.messageId) return prev;
-                const idx = prev.steps.findIndex((s) => s.id === parsed.step.id);
+                const base: LiveStreamState =
+                  prev && prev.messageId === parsed.messageId
+                    ? prev
+                    : {
+                        messageId: parsed.messageId,
+                        mode: 'build',
+                        text: '',
+                        thinking: '',
+                        steps: [],
+                        startedAt: nowTs,
+                      };
+                const idx = base.steps.findIndex((s) => s.id === parsed.step.id);
                 const nextSteps =
                   idx === -1
-                    ? [...prev.steps, parsed.step]
-                    : prev.steps.map((s, i) => (i === idx ? parsed.step : s));
-                return { ...prev, steps: nextSteps, statusText: undefined };
+                    ? [...base.steps, parsed.step]
+                    : base.steps.map((s, i) => (i === idx ? parsed.step : s));
+                return {
+                  ...base,
+                  steps: nextSteps,
+                  statusText: undefined,
+                  lastActivityAt: nowTs,
+                  seq,
+                };
               });
               break;
 
@@ -184,6 +400,8 @@ export default function App() {
                   steps: prev.steps.map((s) =>
                     s.id === parsed.stepId ? { ...s, output: parsed.outputDelta } : s,
                   ),
+                  lastActivityAt: nowTs,
+                  seq,
                 };
               });
               break;
@@ -198,16 +416,35 @@ export default function App() {
                       ? { ...s, status: parsed.status, output: parsed.output ?? s.output }
                       : s,
                   ),
+                  lastActivityAt: nowTs,
+                  seq,
                 };
               });
               break;
 
             case 'agent_status':
-              setLiveStream((prev) =>
-                prev && prev.messageId === parsed.messageId
-                  ? { ...prev, statusText: parsed.statusText }
-                  : prev,
-              );
+              setIsBuilding(true);
+              setLiveStream((prev) => {
+                if (!prev || prev.messageId !== parsed.messageId) {
+                  return {
+                    messageId: parsed.messageId,
+                    mode: 'build',
+                    text: '',
+                    thinking: '',
+                    steps: [],
+                    statusText: parsed.statusText,
+                    startedAt: nowTs,
+                    lastActivityAt: nowTs,
+                    seq,
+                  };
+                }
+                return {
+                  ...prev,
+                  statusText: parsed.statusText,
+                  lastActivityAt: nowTs,
+                  seq,
+                };
+              });
               break;
 
             case 'preview_ready':
@@ -240,22 +477,45 @@ export default function App() {
   }, [closeStream]);
 
   const handleSelectProject = async (projectId: string) => {
+    const reqSeq = ++selectSeqRef.current;
+    closeStream();
+    lastStreamSeqRef.current = 0;
     setActiveProjectId(projectId);
     setLiveStream(null);
     setSuggestBuild(false);
+    setUnreadCompletions((prev) => {
+      if (!(projectId in prev)) return prev;
+      const next = { ...prev };
+      delete next[projectId];
+      return next;
+    });
+
     try {
       const detail = await api.getProject(projectId);
+      if (selectSeqRef.current !== reqSeq || activeProjectIdRef.current !== projectId) {
+        return;
+      }
       setMessages(detail.messages);
       setIsBuilding(detail.isBuilding);
+      if (detail.activeRun) {
+        lastStreamSeqRef.current = detail.activeRun.seq;
+        setLiveStream(snapshotToLiveStream(detail.activeRun));
+      } else {
+        setLiveStream(null);
+      }
       setProjects((prev) => prev.map((p) => (p.id === detail.project.id ? detail.project : p)));
       await connectStream(projectId);
     } catch (err) {
-      alert(err instanceof Error ? err.message : '加载项目失败');
+      if (selectSeqRef.current === reqSeq) {
+        alert(err instanceof Error ? err.message : '加载项目失败');
+      }
     }
   };
 
   const handleNewChat = () => {
+    selectSeqRef.current++;
     closeStream();
+    lastStreamSeqRef.current = 0;
     setActiveProjectId(null);
     setMessages([]);
     setIsBuilding(false);
@@ -278,6 +538,7 @@ export default function App() {
       const created = await api.createProject(text.slice(0, 20));
       targetProjectId = created.project.id;
       activeProjectIdRef.current = targetProjectId;
+      lastStreamSeqRef.current = 0;
       setProjects((prev) => [created.project, ...prev]);
       setActiveProjectId(targetProjectId);
       setMessages([]);
@@ -310,10 +571,16 @@ export default function App() {
   };
 
   const handleLogout = async () => {
+    selectSeqRef.current++;
     closeStream();
+    if (userEventSourceRef.current) {
+      userEventSourceRef.current.close();
+      userEventSourceRef.current = null;
+    }
     await api.logout();
     setUsername(null);
     setProjects([]);
+    setUnreadCompletions({});
     setActiveProjectId(null);
     setMessages([]);
   };
@@ -346,6 +613,7 @@ export default function App() {
         username={username}
         projects={projects}
         activeProjectId={activeProjectId}
+        unreadCompletions={unreadCompletions}
         onSelectProject={(id) => void handleSelectProject(id)}
         onNewChat={handleNewChat}
         onDeleteProject={(id) => void handleDeleteProject(id)}
