@@ -24,6 +24,11 @@ import { Sidebar } from './components/Sidebar';
 import { ChatPanel, type LiveStreamState } from './components/ChatPanel';
 import { WorkspacePanel, type WorkspaceTabKey } from './components/WorkspacePanel';
 
+function upsertById<T extends { id: string }>(list: T[], item: T): T[] {
+  const exists = list.some((x) => x.id === item.id);
+  return exists ? list.map((x) => (x.id === item.id ? item : x)) : [item, ...list];
+}
+
 function snapshotToLiveStream(snapshot: ActiveRunSnapshot | null | undefined): LiveStreamState | null {
   if (!snapshot) return null;
   return {
@@ -66,6 +71,7 @@ export default function App() {
   const selectSeqRef = useRef(0);
   const lastStreamSeqRef = useRef(0);
   const liveStreamRef = useRef<LiveStreamState | null>(null);
+  const creatingProjectRef = useRef<Promise<string> | null>(null);
 
   activeProjectIdRef.current = activeProjectId;
   liveStreamRef.current = liveStream;
@@ -685,16 +691,29 @@ export default function App() {
     text: string,
     opts?: { forceBuild?: boolean; targetAgentId?: string },
   ) => {
-    let targetProjectId = activeProjectId;
+    let targetProjectId = activeProjectIdRef.current;
     if (!targetProjectId) {
-      const created = await api.createProject(text.slice(0, 20), null, opts?.targetAgentId);
-      targetProjectId = created.project.id;
-      activeProjectIdRef.current = targetProjectId;
-      lastStreamSeqRef.current = 0;
-      setProjects((prev) => [created.project, ...prev]);
-      setActiveProjectId(targetProjectId);
-      setMessages([]);
-      await connectStream(targetProjectId);
+      if (creatingProjectRef.current) {
+        targetProjectId = await creatingProjectRef.current;
+      } else {
+        const createPromise = (async () => {
+          const created = await api.createProject(text.slice(0, 20), null, opts?.targetAgentId);
+          const id = created.project.id;
+          activeProjectIdRef.current = id;
+          lastStreamSeqRef.current = 0;
+          setProjects((prev) => upsertById(prev, created.project));
+          setActiveProjectId(id);
+          setMessages([]);
+          await connectStream(id);
+          return id;
+        })();
+        creatingProjectRef.current = createPromise;
+        try {
+          targetProjectId = await createPromise;
+        } finally {
+          creatingProjectRef.current = null;
+        }
+      }
     }
 
     try {
@@ -708,34 +727,18 @@ export default function App() {
       });
 
       if (res.workspace) {
-        setWorkspaces((prev) =>
-          prev.some((w) => w.id === res.workspace!.id)
-            ? prev.map((w) => (w.id === res.workspace!.id ? res.workspace! : w))
-            : [res.workspace!, ...prev],
-        );
+        setWorkspaces((prev) => upsertById(prev, res.workspace!));
       }
       if (res.project) {
-        setProjects((prev) =>
-          prev.some((p) => p.id === res.project!.id)
-            ? prev.map((p) => (p.id === res.project!.id ? res.project! : p))
-            : [res.project!, ...prev],
-        );
+        setProjects((prev) => upsertById(prev, res.project!));
       }
 
       // Cross-Agent auto-fork: immediately register spawned Workspace & Thread and focus the new Thread!
       if (res.mode === 'handoff' && res.spawnedProject) {
         if (res.spawnedWorkspace) {
-          setWorkspaces((prev) =>
-            prev.some((w) => w.id === res.spawnedWorkspace!.id)
-              ? prev.map((w) => (w.id === res.spawnedWorkspace!.id ? res.spawnedWorkspace! : w))
-              : [res.spawnedWorkspace!, ...prev],
-          );
+          setWorkspaces((prev) => upsertById(prev, res.spawnedWorkspace!));
         }
-        setProjects((prev) =>
-          prev.some((p) => p.id === res.spawnedProject!.id)
-            ? prev.map((p) => (p.id === res.spawnedProject!.id ? res.spawnedProject! : p))
-            : [res.spawnedProject!, ...prev],
-        );
+        setProjects((prev) => upsertById(prev, res.spawnedProject!));
         setWorkspaceCollapsed(false);
         setRequestedTab({ tab: 'preview', nonce: Date.now() });
         await handleSelectProject(res.spawnedProject.id);
