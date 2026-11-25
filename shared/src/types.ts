@@ -155,7 +155,17 @@ export interface FileTreeNode {
 }
 
 export type SSEEventPayload =
-  | { type: 'connected'; projectId: string; isBuilding: boolean; activeRun: ActiveRunSnapshot | null }
+  | {
+      type: 'connected';
+      projectId: string;
+      serverBootId: string;
+      projectStatus: ProjectStatus;
+      isBuilding: boolean;
+      activeRun: ActiveRunSnapshot | null;
+      latestMessageId?: string | null;
+      messageCount?: number;
+    }
+  | { type: 'heartbeat' }
   | { type: 'project_updated'; project: ProjectDTO }
   | { type: 'message_created'; message: MessageDTO }
   | { type: 'chat_start'; messageId: string; startedAt?: number }
@@ -179,7 +189,14 @@ export type SSEEvent = SSEEventPayload & {
 };
 
 export type UserGlobalSSEEvent =
-  | { type: 'user_connected'; username: string }
+  | {
+      type: 'user_connected';
+      username: string;
+      serverBootId: string;
+      activeProjectIds: string[];
+      ts: number;
+    }
+  | { type: 'heartbeat'; ts: number }
   | { type: 'workspace_updated'; workspace: WorkspaceDTO }
   | { type: 'workspace_deleted'; workspaceId: string }
   | { type: 'project_updated'; project: ProjectDTO }

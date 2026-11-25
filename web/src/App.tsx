@@ -19,10 +19,67 @@ import type {
   WorkspaceDTO,
 } from '@atoms/shared';
 import { api } from './api';
+import { ResilientEventSource, type ConnectionStatus } from './sse';
 import { LoginPage } from './components/LoginPage';
 import { Sidebar } from './components/Sidebar';
 import { ChatPanel, type LiveStreamState } from './components/ChatPanel';
 import { WorkspacePanel, type WorkspaceTabKey } from './components/WorkspacePanel';
+
+const LAST_PROJECT_STORAGE_KEY = 'atoms:lastActiveProjectId';
+
+function readThreadFromUrl(): string | null {
+  try {
+    return new URLSearchParams(window.location.search).get('thread');
+  } catch {
+    return null;
+  }
+}
+
+function readStoredThread(): string | null {
+  try {
+    return window.localStorage.getItem(LAST_PROJECT_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function persistActiveThread(projectId: string | null): void {
+  try {
+    if (projectId) {
+      window.localStorage.setItem(LAST_PROJECT_STORAGE_KEY, projectId);
+    } else {
+      window.localStorage.removeItem(LAST_PROJECT_STORAGE_KEY);
+    }
+  } catch {
+    // ignore storage errors
+  }
+  try {
+    const url = new URL(window.location.href);
+    if (projectId) {
+      url.searchParams.set('thread', projectId);
+    } else {
+      url.searchParams.delete('thread');
+    }
+    window.history.replaceState(null, '', url.toString());
+  } catch {
+    // ignore history errors
+  }
+}
+
+function pickInitialProjectId(projectList: ProjectDTO[]): string | null {
+  if (projectList.length === 0) return null;
+  const fromUrl = readThreadFromUrl();
+  if (fromUrl && projectList.some((p) => p.id === fromUrl)) {
+    return fromUrl;
+  }
+  const fromStorage = readStoredThread();
+  if (fromStorage && projectList.some((p) => p.id === fromStorage)) {
+    return fromStorage;
+  }
+  // If no explicit saved thread (e.g., new browser/incognito), auto-resume any active running thread
+  const running = projectList.find((p) => p.status === 'building' || p.status === 'queued');
+  return running ? running.id : null;
+}
 
 function upsertById<T extends { id: string }>(list: T[], item: T): T[] {
   const exists = list.some((x) => x.id === item.id);
@@ -64,17 +121,30 @@ export default function App() {
   const [unreadCompletions, setUnreadCompletions] = useState<
     Record<string, 'succeeded' | 'aborted' | 'failed'>
   >({});
+  const [userStreamStatus, setUserStreamStatus] = useState<ConnectionStatus>('closed');
+  const [projectStreamStatus, setProjectStreamStatus] = useState<ConnectionStatus>('closed');
 
-  const eventSourceRef = useRef<EventSource | null>(null);
-  const userEventSourceRef = useRef<EventSource | null>(null);
+  const eventSourceRef = useRef<ResilientEventSource<SSEEvent> | null>(null);
+  const userEventSourceRef = useRef<ResilientEventSource<UserGlobalSSEEvent> | null>(null);
   const activeProjectIdRef = useRef<string | null>(null);
   const selectSeqRef = useRef(0);
   const lastStreamSeqRef = useRef(0);
+  const serverBootIdRef = useRef<string | null>(null);
   const liveStreamRef = useRef<LiveStreamState | null>(null);
+  const isBuildingRef = useRef(false);
+  const messagesRef = useRef<MessageDTO[]>([]);
   const creatingProjectRef = useRef<Promise<string> | null>(null);
+  const reconcilingRef = useRef(false);
+  const lastVisibilitySyncRef = useRef(0);
 
   activeProjectIdRef.current = activeProjectId;
   liveStreamRef.current = liveStream;
+  isBuildingRef.current = isBuilding;
+  messagesRef.current = messages;
+
+  const isReconnecting =
+    userStreamStatus === 'reconnecting' ||
+    (Boolean(activeProjectId) && projectStreamStatus === 'reconnecting');
 
   const activeProject = projects.find((p) => p.id === activeProjectId) || null;
   const activeWorkspace = activeProject?.workspaceId
@@ -91,117 +161,66 @@ export default function App() {
     return { workspaces: wsRes.workspaces, projects: projRes.projects };
   }, []);
 
-  useEffect(() => {
-    api
-      .me()
-      .then((res) => {
-        setUsername(res.user.username);
-        setGlmConfigured(res.glmConfigured);
-        setAgents(res.agents || res.presets || []);
-        return refreshAll();
-      })
-      .catch(() => {
-        setUsername(null);
-      })
-      .finally(() => {
-        setAuthChecked(true);
-      });
-  }, [refreshAll]);
-
-  // Persistent user-level SSE for real-time sidebar sync across ALL workspaces & threads
-  useEffect(() => {
-    if (!username) {
-      if (userEventSourceRef.current) {
-        userEventSourceRef.current.close();
-        userEventSourceRef.current = null;
-      }
-      return;
-    }
-
-    const es = new EventSource('/api/events', { withCredentials: true });
-    userEventSourceRef.current = es;
-
-    es.onmessage = (evt) => {
-      let parsed: UserGlobalSSEEvent;
+  const reconcileActiveProject = useCallback(
+    async (
+      projectId: string,
+      opts?: { refreshLists?: boolean; bumpPreviewIfReady?: boolean },
+    ) => {
+      if (reconcilingRef.current) return;
+      reconcilingRef.current = true;
       try {
-        parsed = JSON.parse(evt.data) as UserGlobalSSEEvent;
-      } catch {
-        return;
-      }
+        const [detail] = await Promise.all([
+          api.getProject(projectId),
+          opts?.refreshLists ? refreshAll().catch(() => null) : Promise.resolve(null),
+        ]);
+        if (activeProjectIdRef.current !== projectId) return;
 
-      switch (parsed.type) {
-        case 'workspace_updated':
-          setWorkspaces((prev) => {
-            const exists = prev.some((w) => w.id === parsed.workspace.id);
-            if (!exists) return [parsed.workspace, ...prev];
-            return prev.map((w) => (w.id === parsed.workspace.id ? parsed.workspace : w));
+        setMessages(detail.messages);
+        setIsBuilding(detail.isBuilding);
+        setProjects((prev) => upsertById(prev, detail.project));
+
+        if (detail.activeRun) {
+          const snap = snapshotToLiveStream(detail.activeRun);
+          lastStreamSeqRef.current = Math.max(lastStreamSeqRef.current, detail.activeRun.seq);
+          setLiveStream((prev) => {
+            if (!snap) return prev;
+            if (!prev || prev.messageId !== snap.messageId || (snap.seq ?? 0) >= (prev.seq ?? 0)) {
+              return snap;
+            }
+            return prev;
           });
-          break;
-
-        case 'workspace_deleted':
-          setWorkspaces((prev) => prev.filter((w) => w.id !== parsed.workspaceId));
-          break;
-
-        case 'project_updated':
-          setProjects((prev) => {
-            const exists = prev.some((p) => p.id === parsed.project.id);
-            if (!exists) return [parsed.project, ...prev];
-            return prev.map((p) => (p.id === parsed.project.id ? parsed.project : p));
-          });
-          break;
-
-        case 'project_activity':
-          setProjects((prev) =>
-            prev.map((p) =>
-              p.id === parsed.projectId
-                ? {
-                    ...p,
-                    status: parsed.status,
-                    activeStep: parsed.activeStep ?? null,
-                    lastActivityAt: parsed.lastActivityAt ?? p.lastActivityAt,
-                  }
-                : p,
-            ),
-          );
-          break;
-
-        case 'project_run_finished':
-          setProjects((prev) => {
-            const exists = prev.some((p) => p.id === parsed.project.id);
-            if (!exists) return [parsed.project, ...prev];
-            return prev.map((p) => (p.id === parsed.project.id ? parsed.project : p));
-          });
-          if (parsed.projectId !== activeProjectIdRef.current) {
-            setUnreadCompletions((prev) => ({ ...prev, [parsed.projectId]: parsed.status }));
+        } else {
+          setLiveStream(null);
+          if (opts?.bumpPreviewIfReady && detail.project.previewRunning) {
+            setPreviewRevision((n) => n + 1);
           }
-          break;
-
-        case 'project_deleted':
-          setProjects((prev) => prev.filter((p) => p.id !== parsed.projectId));
-          setUnreadCompletions((prev) => {
-            if (!(parsed.projectId in prev)) return prev;
-            const next = { ...prev };
-            delete next[parsed.projectId];
-            return next;
-          });
-          break;
+        }
+      } catch {
+        // ignore transient network errors; SSE / next poll will retry
+      } finally {
+        reconcilingRef.current = false;
       }
-    };
-
-    return () => {
-      es.close();
-      if (userEventSourceRef.current === es) {
-        userEventSourceRef.current = null;
-      }
-    };
-  }, [username]);
+    },
+    [refreshAll],
+  );
 
   const closeStream = useCallback(() => {
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
       eventSourceRef.current = null;
     }
+    setProjectStreamStatus('closed');
   }, []);
+
+  const handleAuthExpired = useCallback(() => {
+    closeStream();
+    if (userEventSourceRef.current) {
+      userEventSourceRef.current.close();
+      userEventSourceRef.current = null;
+    }
+    setUserStreamStatus('closed');
+    setUsername(null);
+  }, [closeStream]);
 
   const connectStream = useCallback(
     (projectId: string): Promise<void> => {
@@ -214,69 +233,81 @@ export default function App() {
             resolve();
           }
         };
-        const fallbackTimer = setTimeout(done, 1200);
+        const fallbackTimer = setTimeout(done, 1500);
 
-        const es = new EventSource(`/api/projects/${encodeURIComponent(projectId)}/events`, {
-          withCredentials: true,
-        });
-        eventSourceRef.current = es;
-
-        es.onopen = () => {
-          clearTimeout(fallbackTimer);
-          done();
-        };
-
-        es.onmessage = (evt) => {
-          if (activeProjectIdRef.current !== projectId) return;
-          let parsed: SSEEvent;
-          try {
-            parsed = JSON.parse(evt.data) as SSEEvent;
-          } catch {
-            return;
-          }
-
-          if (parsed.type === 'connected') {
-            setIsBuilding(parsed.isBuilding);
-            if (parsed.activeRun) {
-              const snap = snapshotToLiveStream(parsed.activeRun);
-              lastStreamSeqRef.current = Math.max(lastStreamSeqRef.current, parsed.activeRun.seq);
-              setLiveStream((prev) => {
-                if (!snap) return prev;
-                if (!prev || prev.messageId !== snap.messageId || (snap.seq ?? 0) >= (prev.seq ?? 0)) {
-                  return snap;
-                }
-                return prev;
-              });
-            } else if (liveStreamRef.current) {
-              setLiveStream(null);
-              void api
-                .getProject(projectId)
-                .then((detail) => {
-                  if (activeProjectIdRef.current !== projectId) return;
-                  setMessages(detail.messages);
-                  setIsBuilding(detail.isBuilding);
-                  setProjects((prev) =>
-                    prev.map((p) => (p.id === detail.project.id ? detail.project : p)),
-                  );
-                })
-                .catch(() => {});
+        const es = new ResilientEventSource<SSEEvent>({
+          url: `/api/projects/${encodeURIComponent(projectId)}/events`,
+          onStatusChange: (status) => {
+            if (activeProjectIdRef.current === projectId) {
+              setProjectStreamStatus(status);
             }
+          },
+          onAuthExpired: handleAuthExpired,
+          onOpen: () => {
             clearTimeout(fallbackTimer);
             done();
-            return;
-          }
+          },
+          onMessage: (parsed, meta) => {
+            if (activeProjectIdRef.current !== projectId) return;
 
-          if (typeof parsed.seq === 'number') {
-            if (parsed.seq <= lastStreamSeqRef.current) {
+            if (parsed.type === 'heartbeat') {
               return;
             }
-            lastStreamSeqRef.current = parsed.seq;
-          }
 
-          const nowTs = parsed.ts || Date.now();
-          const seq = parsed.seq;
+            if (parsed.type === 'connected') {
+              const bootChanged =
+                Boolean(serverBootIdRef.current) &&
+                Boolean(parsed.serverBootId) &&
+                serverBootIdRef.current !== parsed.serverBootId;
+              if (parsed.serverBootId) {
+                serverBootIdRef.current = parsed.serverBootId;
+              }
 
-          switch (parsed.type) {
+              // Trust server's authoritative seq at handshake (prevents seq deadlock after server restart)
+              lastStreamSeqRef.current = typeof parsed.seq === 'number' ? parsed.seq : 0;
+
+              const wasWorking = Boolean(liveStreamRef.current || isBuildingRef.current);
+              setIsBuilding(parsed.isBuilding);
+
+              if (parsed.activeRun) {
+                const snap = snapshotToLiveStream(parsed.activeRun);
+                if (snap) {
+                  setLiveStream(snap);
+                }
+              } else {
+                setLiveStream(null);
+              }
+
+              const localMsgs = messagesRef.current;
+              const localLatestId = localMsgs.length > 0 ? localMsgs[localMsgs.length - 1].id : null;
+              const messagesDiverged =
+                (parsed.latestMessageId !== undefined && parsed.latestMessageId !== localLatestId) ||
+                (parsed.messageCount !== undefined && parsed.messageCount !== localMsgs.length);
+              const finishedWhileAway = wasWorking && !parsed.activeRun && !parsed.isBuilding;
+
+              if (meta.isReconnect || bootChanged || messagesDiverged || finishedWhileAway) {
+                void reconcileActiveProject(projectId, {
+                  refreshLists: meta.isReconnect || bootChanged || finishedWhileAway,
+                  bumpPreviewIfReady: finishedWhileAway,
+                });
+              }
+
+              clearTimeout(fallbackTimer);
+              done();
+              return;
+            }
+
+            if (typeof parsed.seq === 'number') {
+              if (parsed.seq <= lastStreamSeqRef.current) {
+                return;
+              }
+              lastStreamSeqRef.current = parsed.seq;
+            }
+
+            const nowTs = parsed.ts || Date.now();
+            const seq = parsed.seq;
+
+            switch (parsed.type) {
             case 'project_updated':
               setProjects((prev) => {
                 const exists = prev.some((p) => p.id === parsed.project.id);
@@ -529,57 +560,247 @@ export default function App() {
               setLiveStream(null);
               break;
           }
-        };
+          },
+        });
+        eventSourceRef.current = es;
       });
     },
-    [closeStream, refreshAll],
+    [closeStream, handleAuthExpired, reconcileActiveProject, refreshAll],
   );
 
   useEffect(() => {
     return () => closeStream();
   }, [closeStream]);
 
-  const handleSelectProject = async (projectId: string) => {
-    const reqSeq = ++selectSeqRef.current;
-    closeStream();
-    lastStreamSeqRef.current = 0;
-    setActiveProjectId(projectId);
-    setLiveStream(null);
-    setSuggestBuild(false);
-    setUnreadCompletions((prev) => {
-      if (!(projectId in prev)) return prev;
-      const next = { ...prev };
-      delete next[projectId];
-      return next;
-    });
+  const handleSelectProject = useCallback(
+    async (projectId: string) => {
+      const reqSeq = ++selectSeqRef.current;
+      closeStream();
+      lastStreamSeqRef.current = 0;
+      setActiveProjectId(projectId);
+      persistActiveThread(projectId);
+      setLiveStream(null);
+      setSuggestBuild(false);
+      setUnreadCompletions((prev) => {
+        if (!(projectId in prev)) return prev;
+        const next = { ...prev };
+        delete next[projectId];
+        return next;
+      });
 
-    try {
-      const detail = await api.getProject(projectId);
-      if (selectSeqRef.current !== reqSeq || activeProjectIdRef.current !== projectId) {
-        return;
+      try {
+        const detail = await api.getProject(projectId);
+        if (selectSeqRef.current !== reqSeq || activeProjectIdRef.current !== projectId) {
+          return;
+        }
+        messagesRef.current = detail.messages;
+        isBuildingRef.current = detail.isBuilding;
+        setMessages(detail.messages);
+        setIsBuilding(detail.isBuilding);
+        if (detail.activeRun) {
+          const snap = snapshotToLiveStream(detail.activeRun);
+          lastStreamSeqRef.current = detail.activeRun.seq;
+          liveStreamRef.current = snap;
+          setLiveStream(snap);
+        } else {
+          liveStreamRef.current = null;
+          setLiveStream(null);
+        }
+        setProjects((prev) => upsertById(prev, detail.project));
+        await connectStream(projectId);
+      } catch (err) {
+        if (selectSeqRef.current === reqSeq) {
+          alert(err instanceof Error ? err.message : '加载对话失败');
+        }
       }
-      setMessages(detail.messages);
-      setIsBuilding(detail.isBuilding);
-      if (detail.activeRun) {
-        lastStreamSeqRef.current = detail.activeRun.seq;
-        setLiveStream(snapshotToLiveStream(detail.activeRun));
-      } else {
-        setLiveStream(null);
+    },
+    [closeStream, connectStream],
+  );
+
+  // Initial auth check + auto-restore last/running thread after page reload or reopen
+  useEffect(() => {
+    api
+      .me()
+      .then(async (res) => {
+        setUsername(res.user.username);
+        setGlmConfigured(res.glmConfigured);
+        setAgents(res.agents || res.presets || []);
+        const { projects: loadedProjects } = await refreshAll();
+        const initialId = pickInitialProjectId(loadedProjects);
+        if (initialId) {
+          void handleSelectProject(initialId);
+        }
+      })
+      .catch(() => {
+        setUsername(null);
+      })
+      .finally(() => {
+        setAuthChecked(true);
+      });
+  }, [refreshAll, handleSelectProject]);
+
+  // Persistent self-healing user-level SSE for real-time sidebar sync across ALL workspaces & threads
+  useEffect(() => {
+    if (!username) {
+      if (userEventSourceRef.current) {
+        userEventSourceRef.current.close();
+        userEventSourceRef.current = null;
       }
-      setProjects((prev) => prev.map((p) => (p.id === detail.project.id ? detail.project : p)));
-      await connectStream(projectId);
-    } catch (err) {
-      if (selectSeqRef.current === reqSeq) {
-        alert(err instanceof Error ? err.message : '加载对话失败');
-      }
+      setUserStreamStatus('closed');
+      return;
     }
-  };
+
+    const es = new ResilientEventSource<UserGlobalSSEEvent>({
+      url: '/api/events',
+      onStatusChange: (status) => setUserStreamStatus(status),
+      onAuthExpired: handleAuthExpired,
+      onMessage: (parsed, meta) => {
+        if (parsed.type === 'heartbeat') return;
+
+        if (parsed.type === 'user_connected') {
+          const bootChanged =
+            Boolean(serverBootIdRef.current) &&
+            Boolean(parsed.serverBootId) &&
+            serverBootIdRef.current !== parsed.serverBootId;
+          if (parsed.serverBootId) {
+            serverBootIdRef.current = parsed.serverBootId;
+          }
+          if (meta.isReconnect || bootChanged) {
+            void refreshAll().catch(() => {});
+            const currentId = activeProjectIdRef.current;
+            if (currentId) {
+              void reconcileActiveProject(currentId, { bumpPreviewIfReady: true });
+            }
+          }
+          return;
+        }
+
+        switch (parsed.type) {
+          case 'workspace_updated':
+            setWorkspaces((prev) => upsertById(prev, parsed.workspace));
+            break;
+
+          case 'workspace_deleted':
+            setWorkspaces((prev) => prev.filter((w) => w.id !== parsed.workspaceId));
+            break;
+
+          case 'project_updated':
+            setProjects((prev) => upsertById(prev, parsed.project));
+            break;
+
+          case 'project_activity':
+            setProjects((prev) =>
+              prev.map((p) =>
+                p.id === parsed.projectId
+                  ? {
+                      ...p,
+                      status: parsed.status,
+                      activeStep: parsed.activeStep ?? null,
+                      lastActivityAt: parsed.lastActivityAt ?? p.lastActivityAt,
+                    }
+                  : p,
+              ),
+            );
+            break;
+
+          case 'project_run_finished':
+            setProjects((prev) => upsertById(prev, parsed.project));
+            if (parsed.projectId !== activeProjectIdRef.current) {
+              setUnreadCompletions((prev) => ({ ...prev, [parsed.projectId]: parsed.status }));
+            }
+            break;
+
+          case 'project_deleted':
+            setProjects((prev) => prev.filter((p) => p.id !== parsed.projectId));
+            setUnreadCompletions((prev) => {
+              if (!(parsed.projectId in prev)) return prev;
+              const next = { ...prev };
+              delete next[parsed.projectId];
+              return next;
+            });
+            break;
+        }
+      },
+    });
+    userEventSourceRef.current = es;
+
+    return () => {
+      es.close();
+      if (userEventSourceRef.current === es) {
+        userEventSourceRef.current = null;
+      }
+      setUserStreamStatus('closed');
+    };
+  }, [username, handleAuthExpired, reconcileActiveProject, refreshAll]);
+
+  // Recover immediately when tab returns from background, laptop wakes from sleep, or network returns
+  useEffect(() => {
+    if (!username) return;
+
+    const syncOnResume = (forceReconnect = false) => {
+      if (document.visibilityState === 'hidden') return;
+      const now = Date.now();
+      if (!forceReconnect && now - lastVisibilitySyncRef.current < 1500) return;
+      lastVisibilitySyncRef.current = now;
+
+      if (userEventSourceRef.current && (forceReconnect || userEventSourceRef.current.isStale(20_000))) {
+        userEventSourceRef.current.reconnectNow();
+      }
+      if (eventSourceRef.current && (forceReconnect || eventSourceRef.current.isStale(20_000))) {
+        eventSourceRef.current.reconnectNow();
+      }
+
+      void refreshAll().catch(() => {});
+      const currentId = activeProjectIdRef.current;
+      if (currentId) {
+        void reconcileActiveProject(currentId, { bumpPreviewIfReady: true });
+      }
+    };
+
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') syncOnResume(false);
+    };
+    const onFocus = () => syncOnResume(false);
+    const onOnline = () => syncOnResume(true);
+
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('focus', onFocus);
+    window.addEventListener('online', onOnline);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('focus', onFocus);
+      window.removeEventListener('online', onOnline);
+    };
+  }, [username, reconcileActiveProject, refreshAll]);
+
+  // Fallback HTTP polling ONLY while SSE is unhealthy and an active run is in progress
+  const hasLiveStream = Boolean(liveStream);
+  useEffect(() => {
+    if (!activeProjectId || !isReconnecting || (!isBuilding && !hasLiveStream)) return;
+    const timer = window.setInterval(() => {
+      void reconcileActiveProject(activeProjectId, {
+        refreshLists: true,
+        bumpPreviewIfReady: true,
+      });
+    }, 4000);
+    return () => window.clearInterval(timer);
+  }, [activeProjectId, isReconnecting, isBuilding, hasLiveStream, reconcileActiveProject]);
+
+  const handleRetryConnection = useCallback(() => {
+    userEventSourceRef.current?.reconnectNow();
+    eventSourceRef.current?.reconnectNow();
+    void refreshAll().catch(() => {});
+    if (activeProjectIdRef.current) {
+      void reconcileActiveProject(activeProjectIdRef.current, { bumpPreviewIfReady: true });
+    }
+  }, [reconcileActiveProject, refreshAll]);
 
   const handleNewChat = () => {
     selectSeqRef.current++;
     closeStream();
     lastStreamSeqRef.current = 0;
     setActiveProjectId(null);
+    persistActiveThread(null);
     setMessages([]);
     setIsBuilding(false);
     setSuggestBuild(false);
@@ -703,6 +924,7 @@ export default function App() {
           lastStreamSeqRef.current = 0;
           setProjects((prev) => upsertById(prev, created.project));
           setActiveProjectId(id);
+          persistActiveThread(id);
           setMessages([]);
           await connectStream(id);
           return id;
@@ -766,6 +988,7 @@ export default function App() {
     setProjects([]);
     setUnreadCompletions({});
     setActiveProjectId(null);
+    persistActiveThread(null);
     setMessages([]);
   };
 
@@ -786,7 +1009,12 @@ export default function App() {
             setGlmConfigured(res.glmConfigured);
             setAgents(res.agents || res.presets || []);
           });
-          void refreshAll();
+          void refreshAll().then(({ projects: loadedProjects }) => {
+            const initialId = pickInitialProjectId(loadedProjects);
+            if (initialId) {
+              void handleSelectProject(initialId);
+            }
+          });
         }}
       />
     );
@@ -820,6 +1048,8 @@ export default function App() {
         isBuilding={isBuilding}
         suggestBuild={suggestBuild}
         glmConfigured={glmConfigured}
+        connectionState={isReconnecting ? 'reconnecting' : 'connected'}
+        onRetryConnection={handleRetryConnection}
         onSend={handleSend}
         onAbort={handleAbort}
         onOpenPreview={() => {

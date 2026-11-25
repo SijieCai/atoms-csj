@@ -432,6 +432,24 @@ export const dbStore = {
     return rows.map(toMessageDTO);
   },
 
+  getProjectMessageSummary(projectId: string): { count: number; latestMessageId: string | null } {
+    const countRow = db
+      .prepare(`SELECT COUNT(*) AS cnt FROM messages WHERE project_id = ?`)
+      .get(projectId) as unknown as { cnt: number } | undefined;
+    const latestRow = db
+      .prepare(`
+        SELECT id FROM messages
+        WHERE project_id = ?
+        ORDER BY created_at DESC, rowid DESC
+        LIMIT 1
+      `)
+      .get(projectId) as unknown as { id: string } | undefined;
+    return {
+      count: Number(countRow?.cnt || 0),
+      latestMessageId: latestRow?.id ?? null,
+    };
+  },
+
   // ---- Agent Runs ----
   createAgentRun(projectId: string, prompt: string): string {
     const id = generateId('run');
@@ -470,12 +488,34 @@ export const dbStore = {
     for (const row of stale) {
       const nextStatus: ProjectStatus = row.workspace_id || row.has_workspace ? 'ready' : 'error';
       db.prepare(`UPDATE projects SET status = ?, updated_at = ? WHERE id = ?`).run(nextStatus, now, row.id);
-      this.addMessage(
-        row.id,
-        'assistant',
-        '服务端已重启，上次中断的构建任务状态已自动恢复。你可以继续对话或重新发起构建。',
-        { mode: 'build', aborted: true },
-      );
+
+      // Preserve any checkpointed assistant placeholder instead of leaving an empty bubble behind
+      const lastMsg = db
+        .prepare(`
+          SELECT id, project_id, role, content, metadata_json, created_at
+          FROM messages
+          WHERE project_id = ?
+          ORDER BY created_at DESC, rowid DESC
+          LIMIT 1
+        `)
+        .get(row.id) as unknown as MessageRow | undefined;
+
+      const notice = '服务端已重启，上次中断的任务状态已自动恢复。你可以继续对话或重新发起任务。';
+      if (lastMsg && lastMsg.role === 'assistant') {
+        const dto = toMessageDTO(lastMsg);
+        const existingContent = dto.content.trim();
+        const mergedContent = existingContent ? `${existingContent}\n\n---\n${notice}` : notice;
+        const mergedMeta: MessageMetadata = {
+          ...(dto.metadata || { mode: 'build' }),
+          aborted: true,
+          steps: (dto.metadata?.steps || []).map((s) =>
+            s.status === 'running' ? { ...s, status: 'error' as const } : s,
+          ),
+        };
+        this.updateMessage(lastMsg.id, mergedContent, mergedMeta);
+      } else {
+        this.addMessage(row.id, 'assistant', notice, { mode: 'build', aborted: true });
+      }
     }
 
     return stale;
