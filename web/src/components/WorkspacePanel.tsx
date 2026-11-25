@@ -16,6 +16,7 @@ import {
   FlaskConical,
   BookOpen,
   Clock,
+  PanelRightClose,
 } from 'lucide-react';
 import type { AgentPresetSummary, FileTreeNode, TableInfoDTO, WorkspaceDTO } from '@atoms/shared';
 import { api } from '../api';
@@ -29,6 +30,8 @@ interface WorkspacePanelProps {
   previewRevision: number;
   isBuilding: boolean;
   requestedTab?: { tab: WorkspaceTabKey; nonce: number } | null;
+  collapsed?: boolean;
+  onCollapse?: () => void;
 }
 
 export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
@@ -37,6 +40,8 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
   previewRevision,
   isBuilding,
   requestedTab,
+  collapsed = false,
+  onCollapse,
 }) => {
   const isResearch = workspace.presetId === 'deep-research' || agent?.icon === 'research';
   const visibleTabs: WorkspaceTabKey[] = agent?.ui?.tabs?.length
@@ -163,8 +168,12 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
   return (
     <section
       className={`${
-        tab === 'code' ? 'w-[58%] max-w-[1040px]' : 'w-[48%] max-w-[840px]'
-      } min-w-[460px] border-l border-slate-200 bg-slate-50 flex flex-col shrink-0 transition-[width] duration-150`}
+        collapsed
+          ? 'hidden'
+          : tab === 'code'
+            ? 'w-[58%] max-w-[1040px] flex'
+            : 'w-[48%] max-w-[840px] flex'
+      } min-w-[460px] border-l border-slate-200 bg-slate-50 flex-col shrink-0 transition-[width] duration-150`}
     >
       {/* Tab Bar */}
       <div className="h-13 px-3 border-b border-slate-200 bg-white flex items-center justify-between gap-2 shrink-0">
@@ -228,7 +237,7 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
           )}
         </div>
 
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1">
           <button
             type="button"
             disabled={restarting || workspaceBusy}
@@ -238,6 +247,17 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({
           >
             <RotateCcw className={`w-3.5 h-3.5 ${restarting ? 'animate-spin' : ''}`} />
           </button>
+          {onCollapse && (
+            <button
+              type="button"
+              onClick={onCollapse}
+              title="向右折叠工作区面板，扩大对话空间"
+              className="inline-flex items-center gap-1 px-2 py-1.5 rounded-lg text-xs font-medium text-slate-500 hover:text-slate-900 hover:bg-slate-100 transition cursor-pointer"
+            >
+              <PanelRightClose className="w-4 h-4" />
+              <span className="hidden xl:inline">折叠</span>
+            </button>
+          )}
         </div>
       </div>
 

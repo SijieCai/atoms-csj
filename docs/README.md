@@ -10,6 +10,7 @@
 |---|---|---|
 | 2026-11-25 | [`2026-11-25-workspace-thread-decoupling.md`](./architecture/2026-11-25-workspace-thread-decoupling.md) | P0 IDE/工作区视图彻底隔离 + P1 `Workspace (1) : Thread (N)` 领域解耦与同仓库串行写队列 |
 | 2026-11-25 | [`2026-11-25-deep-research-agent-and-recipes.md`](./architecture/2026-11-25-deep-research-agent-and-recipes.md) | Deep Research Agent 扩展（GitHub Skill + 外网爬虫 MCP + 报告模板）、`agents/` 声明式配方目录、多 Agent 意图路由与跨 Agent 自动新建 Thread |
+| 2026-11-25 | [`2026-11-25-workspace-panel-collapse.md`](./architecture/2026-11-25-workspace-panel-collapse.md) | 右侧工作区面板支持最小化/右折叠（保留编辑与预览状态、右侧轻量停靠条与快捷展开） |
 
 ## 问题排查与修复复盘 (`docs/issues/`)
 

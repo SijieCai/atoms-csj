@@ -16,6 +16,7 @@ import {
   Clock,
   ArrowRight,
   GitFork,
+  PanelRightOpen,
 } from 'lucide-react';
 import type { AgentPresetSummary, AgentToolStep, MessageDTO, ProjectDTO, WorkspaceDTO } from '@atoms/shared';
 import { AgentStepCard } from './AgentStepCard';
@@ -49,6 +50,8 @@ interface ChatPanelProps {
   onAbort: () => Promise<void>;
   onOpenPreview: () => void;
   onOpenVsCode: () => void;
+  workspaceCollapsed?: boolean;
+  onExpandWorkspace?: () => void;
   onSelectProject: (id: string) => void;
   onBindWorkspace: (opts: {
     workspaceId?: string;
@@ -93,6 +96,8 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   onAbort,
   onOpenPreview,
   onOpenVsCode,
+  workspaceCollapsed = false,
+  onExpandWorkspace,
   onSelectProject,
   onBindWorkspace,
 }) => {
@@ -242,6 +247,22 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
         </div>
 
         {/* Right Header Actions */}
+        {workspace && workspaceCollapsed && onExpandWorkspace && (
+          <button
+            type="button"
+            onClick={onExpandWorkspace}
+            title={`展开右侧${isResearchWs ? '研究空间' : '代码仓库'}面板`}
+            className={`inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1.5 rounded-lg border transition cursor-pointer shrink-0 ${
+              isResearchWs
+                ? 'bg-teal-50 hover:bg-teal-100 text-teal-800 border-teal-200'
+                : 'bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border-indigo-200'
+            }`}
+          >
+            <PanelRightOpen className="w-3.5 h-3.5" />
+            展开{isResearchWs ? '研究报告' : '工作区'}
+          </button>
+        )}
+
         {project && !workspace && !isBuilding && (
           <div className="flex items-center gap-2 shrink-0">
             <div className="relative" ref={menuRef}>
