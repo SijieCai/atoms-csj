@@ -8,6 +8,13 @@
   "templateId": "deep-research",
   "plugins": ["deep-research"],
   "systemPromptFile": "SYSTEM.md",
+  "budget": {
+    "maxDurationMs": 360000,
+    "maxCostCny": 2.0,
+    "maxTokens": 300000,
+    "maxToolCalls": 25,
+    "softWarnRatio": 0.75
+  },
   "intent": {
     "description": "用户希望针对某个主题、技术、行业、产品或竞品开展深入网络调研、多源信息搜集、事实核查、对比分析或输出带来源引用的研究报告。",
     "keywords": [

@@ -109,6 +109,27 @@ const sessionSecret =
     ? process.env.SESSION_SECRET
     : crypto.createHash('sha256').update(`atoms-${appEnv}-secret:${REPO_ROOT}`).digest('hex');
 
+function parseOptionalPositiveNumber(raw: string | undefined): number | undefined {
+  if (raw === undefined || raw.trim() === '') return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+function defaultModelPricingCnyPerM(model: string): { input: number; output: number; cacheRead: number } {
+  const lower = model.toLowerCase();
+  if (lower.includes('flash')) {
+    // GLM Flash series (approx CNY per 1M tokens; override via GLM_*_PRICE_PER_M)
+    return { input: 0.5, output: 2.0, cacheRead: 0.1 };
+  }
+  if (lower.includes('air')) {
+    return { input: 1.0, output: 4.0, cacheRead: 0.2 };
+  }
+  // GLM flagship series (e.g. glm-5 / glm-4.7)
+  return { input: 4.0, output: 16.0, cacheRead: 1.0 };
+}
+
+const defaultPricing = defaultModelPricingCnyPerM(glmModel);
+
 export const config = {
   port,
   appEnv,
@@ -140,12 +161,20 @@ export const config = {
   glmBaseUrl,
   glmModel,
   glmChatModel,
+  glmInputPricePerM: Number(process.env.GLM_INPUT_PRICE_PER_M || defaultPricing.input),
+  glmOutputPricePerM: Number(process.env.GLM_OUTPUT_PRICE_PER_M || defaultPricing.output),
+  glmCacheReadPricePerM: Number(process.env.GLM_CACHE_READ_PRICE_PER_M || defaultPricing.cacheRead),
 
   tavilyApiKey: (process.env.TAVILY_API_KEY || '').trim(),
   firecrawlApiKey: (process.env.FIRECRAWL_API_KEY || '').trim(),
 
   agentTimeoutMs: Number(process.env.AGENT_TIMEOUT_MS || 1_800_000),
   agentIdleTimeoutMs: Number(process.env.AGENT_IDLE_TIMEOUT_MS || 300_000),
+  agentBudgetMaxDurationMs: parseOptionalPositiveNumber(process.env.AGENT_BUDGET_MAX_DURATION_MS),
+  agentBudgetMaxCostCny: parseOptionalPositiveNumber(process.env.AGENT_BUDGET_MAX_COST_CNY),
+  agentBudgetMaxTokens: parseOptionalPositiveNumber(process.env.AGENT_BUDGET_MAX_TOKENS),
+  agentBudgetMaxToolCalls: parseOptionalPositiveNumber(process.env.AGENT_BUDGET_MAX_TOOL_CALLS),
+  agentBudgetSoftRatio: parseOptionalPositiveNumber(process.env.AGENT_BUDGET_SOFT_RATIO),
   maxConcurrentAgents: Number(process.env.MAX_CONCURRENT_AGENTS || 2),
   previewPortStart: Number(process.env.PREVIEW_PORT_START || 14_000),
   previewPortEnd: Number(process.env.PREVIEW_PORT_END || 14_200),

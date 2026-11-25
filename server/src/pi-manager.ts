@@ -1,7 +1,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import type { ActiveRunSnapshot, AgentToolStep, MessageDTO, MessageMetadata } from '@atoms/shared';
+import type {
+  ActiveRunSnapshot,
+  AgentBudgetConfig,
+  AgentBudgetSnapshot,
+  AgentToolStep,
+  AgentUsageStats,
+  MessageDTO,
+  MessageMetadata,
+} from '@atoms/shared';
 import { config, ensureDataDirs } from './config.js';
 import { dbStore, generateId, toProjectDTO, toWorkspaceDTO } from './db.js';
 import { eventBus } from './event-bus.js';
@@ -116,9 +124,174 @@ export interface StartBuildParams {
   onSettled: (workspaceId: string, ok: boolean) => Promise<string | null>;
 }
 
+interface UsageBucket {
+  input: number;
+  output: number;
+  cacheRead: number;
+  total: number;
+}
+
+function emptyUsageBucket(): UsageBucket {
+  return { input: 0, output: 0, cacheRead: 0, total: 0 };
+}
+
+function parseUsageBucket(raw: unknown): UsageBucket | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const obj = raw as Record<string, unknown>;
+  const input = Number(obj.input ?? obj.promptTokens ?? obj.input_tokens ?? 0);
+  const output = Number(obj.output ?? obj.completionTokens ?? obj.output_tokens ?? 0);
+  const cacheRead = Number(obj.cacheRead ?? obj.cache_read_input_tokens ?? 0);
+  const totalRaw = Number(obj.totalTokens ?? obj.total_tokens ?? 0);
+  const safeIn = Number.isFinite(input) && input > 0 ? input : 0;
+  const safeOut = Number.isFinite(output) && output > 0 ? output : 0;
+  const safeCache = Number.isFinite(cacheRead) && cacheRead > 0 ? cacheRead : 0;
+  const total = Number.isFinite(totalRaw) && totalRaw > 0 ? totalRaw : safeIn + safeOut + safeCache;
+  if (total === 0 && safeIn === 0 && safeOut === 0 && safeCache === 0) return null;
+  return { input: safeIn, output: safeOut, cacheRead: safeCache, total };
+}
+
+function resolveEffectiveBudget(
+  isResearch: boolean,
+  recipeBudget?: Partial<AgentBudgetConfig>,
+): AgentBudgetConfig {
+  const defaultDuration = isResearch ? 360_000 : 720_000;
+  const defaultCost = isResearch ? 2.0 : 5.0;
+  const defaultTokens = isResearch ? 300_000 : 500_000;
+  const defaultTools = isResearch ? 25 : 45;
+
+  const rawDuration = config.agentBudgetMaxDurationMs ?? recipeBudget?.maxDurationMs ?? defaultDuration;
+  const maxDurationMs = Math.max(30_000, Math.min(config.agentTimeoutMs, rawDuration));
+  const maxCostCny = Math.max(0.05, config.agentBudgetMaxCostCny ?? recipeBudget?.maxCostCny ?? defaultCost);
+  const maxTokens = Math.max(10_000, config.agentBudgetMaxTokens ?? recipeBudget?.maxTokens ?? defaultTokens);
+  const maxToolCalls = Math.max(3, config.agentBudgetMaxToolCalls ?? recipeBudget?.maxToolCalls ?? defaultTools);
+  const rawSoft = config.agentBudgetSoftRatio ?? recipeBudget?.softWarnRatio ?? 0.75;
+  const softWarnRatio = Math.min(0.95, Math.max(0.5, rawSoft));
+
+  return { maxDurationMs, maxCostCny, maxTokens, maxToolCalls, softWarnRatio };
+}
+
+interface ArchivedSourceItem {
+  id?: number;
+  title?: string;
+  url?: string;
+  domain?: string;
+  type?: string;
+  status?: string;
+  noteFile?: string;
+  publishedAt?: string;
+  summary?: string;
+}
+
+function isPlaceholderResearchReport(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+  if (trimmed.includes('# 深度研究报告（准备中）') && trimmed.length < 400) return true;
+  return trimmed.length < 100;
+}
+
+function synthesizePartialResearchReportIfNeeded(
+  workspaceDir: string,
+  reasonLabel: string,
+  usage: AgentUsageStats,
+): { synthesized: boolean; hasArtifacts: boolean; totalSources: number; fetchedCount: number } {
+  const reportPath = path.join(workspaceDir, 'report.md');
+  const sourcesPath = path.join(workspaceDir, 'sources.json');
+  const planPath = path.join(workspaceDir, 'plan.md');
+
+  let sources: ArchivedSourceItem[] = [];
+  if (fs.existsSync(sourcesPath)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(sourcesPath, 'utf8'));
+      if (Array.isArray(parsed)) sources = parsed as ArchivedSourceItem[];
+    } catch {
+      sources = [];
+    }
+  }
+
+  const existingReport = fs.existsSync(reportPath) ? fs.readFileSync(reportPath, 'utf8') : '';
+  const alreadyHasFullReport = !isPlaceholderResearchReport(existingReport);
+  const fetchedSources = sources.filter((s) => s.status === 'fetched');
+  const snippetSources = sources.filter((s) => s.status !== 'fetched');
+
+  if (alreadyHasFullReport) {
+    return {
+      synthesized: false,
+      hasArtifacts: true,
+      totalSources: sources.length,
+      fetchedCount: fetchedSources.length,
+    };
+  }
+
+  if (sources.length === 0) {
+    return { synthesized: false, hasArtifacts: false, totalSources: 0, fetchedCount: 0 };
+  }
+
+  const planText = fs.existsSync(planPath) ? fs.readFileSync(planPath, 'utf8').trim() : '';
+  const durationSec = Math.round(usage.elapsedMs / 1000);
+  const lines: string[] = [
+    '# 阶段性深度调研摘要（已自动保存）',
+    '',
+    `> **说明**：本次深度调研因 **${reasonLabel}** 提前结束，尚未完成最终综合报告撰写。系统已自动保留全部检索与精读归档（共收录 **${sources.length}** 条信源，其中深度精读 **${fetchedSources.length}** 篇；耗时 ${durationSec}s，工具调用 ${usage.toolCalls} 次，累计 ${usage.totalTokens.toLocaleString()} tokens，估算 ¥${usage.estimatedCostCny.toFixed(4)}）。`,
+    '> 你可以直接查看下方各文章摘要与右侧「参考信源」面板，或在对话框发送「请基于已收集的信源整理输出完整研究报告」继续收尾。',
+    '',
+  ];
+
+  if (planText && !planText.includes('待 Agent 规划') && planText.length > 40) {
+    lines.push('## 一、调研计划概览', '', planText.slice(0, 2000), '');
+  }
+
+  if (fetchedSources.length > 0) {
+    lines.push(`## 二、已精读核心文章摘要（${fetchedSources.length} 篇）`, '');
+    for (const s of fetchedSources) {
+      const id = s.id ?? '?';
+      lines.push(`### [${id}] ${s.title || s.url || '未命名文章'}`);
+      lines.push(
+        `- **原文链接**：${s.url || '—'}${s.domain ? `（${s.domain}）` : ''}${s.noteFile ? ` · **全文笔记**：\`${s.noteFile}\`` : ''}`,
+      );
+      if (s.summary) {
+        lines.push(`- **核心摘要**：${s.summary}`);
+      }
+      lines.push('');
+    }
+  }
+
+  if (snippetSources.length > 0) {
+    lines.push(`## 三、已检索候选文章与摘要清单（${snippetSources.length} 篇）`, '');
+    for (const s of snippetSources.slice(0, 40)) {
+      const id = s.id ?? '?';
+      const title = s.title || s.url || '未命名来源';
+      const url = s.url || '#';
+      lines.push(`- **[${id}] [${title}](${url})**${s.publishedAt ? ` (${s.publishedAt})` : ''}`);
+      if (s.summary) {
+        lines.push(`  - 摘要：${s.summary}`);
+      }
+    }
+    if (snippetSources.length > 40) {
+      lines.push(`- *其余 ${snippetSources.length - 40} 条检索记录已完整保存在 \`sources.json\` 与 \`sources/00-search-digest.md\` 中。*`);
+    }
+    lines.push('');
+  }
+
+  lines.push('## 参考信源清单（References）', '');
+  for (const s of sources) {
+    const id = s.id ?? '?';
+    lines.push(`- [${id}] [${s.title || s.url}](${s.url || '#'}) — ${s.status === 'fetched' ? '已精读' : '检索摘要'}`);
+  }
+  lines.push('');
+
+  fs.writeFileSync(reportPath, lines.join('\n'), 'utf8');
+  return {
+    synthesized: true,
+    hasArtifacts: true,
+    totalSources: sources.length,
+    fetchedCount: fetchedSources.length,
+  };
+}
+
 interface ActiveRun {
   projectId: string;
   workspaceId: string;
+  workspaceDir: string;
   presetId: string;
   owner: string;
   runId: string;
@@ -127,6 +300,7 @@ interface ActiveRun {
   startedAt: number;
   lastActivityAt: number;
   lastActivityBroadcastAt: number;
+  lastBudgetBroadcastAt: number;
   statusText?: string;
   lastSeq: number;
   assistantText: string;
@@ -137,8 +311,15 @@ interface ActiveRun {
   settled: boolean;
   lastError?: string;
   stderrBuf: string;
+  budget: AgentBudgetConfig;
+  softWarned: boolean;
+  budgetExceededReason?: string;
+  committedUsage: UsageBucket;
+  inflightUsage: UsageBucket;
+  toolCalls: number;
   timeoutTimer: NodeJS.Timeout;
   idleTimer: NodeJS.Timeout;
+  budgetTimer: NodeJS.Timeout;
   lastCheckpointAt: number;
   reqSeq: number;
   onSettled: (workspaceId: string, ok: boolean) => Promise<string | null>;
@@ -218,6 +399,142 @@ class PiAgentManager {
     };
   }
 
+  private computeUsageStats(run: ActiveRun): AgentUsageStats {
+    const inputTokens = run.committedUsage.input + run.inflightUsage.input;
+    const outputTokens = run.committedUsage.output + run.inflightUsage.output;
+    const cacheReadTokens = run.committedUsage.cacheRead + run.inflightUsage.cacheRead;
+    const totalTokens = run.committedUsage.total + run.inflightUsage.total;
+    const rawCost =
+      (inputTokens * config.glmInputPricePerM +
+        outputTokens * config.glmOutputPricePerM +
+        cacheReadTokens * config.glmCacheReadPricePerM) /
+      1_000_000;
+    const estimatedCostCny = Math.round(rawCost * 10000) / 10000;
+    return {
+      inputTokens,
+      outputTokens,
+      cacheReadTokens,
+      totalTokens,
+      estimatedCostCny,
+      toolCalls: run.toolCalls,
+      elapsedMs: Math.max(0, Date.now() - run.startedAt),
+    };
+  }
+
+  private buildBudgetSnapshot(run: ActiveRun): AgentBudgetSnapshot {
+    return {
+      limits: { ...run.budget },
+      softWarned: run.softWarned,
+      exceededReason: run.budgetExceededReason,
+    };
+  }
+
+  private emitBudgetUpdate(run: ActiveRun, force = false): void {
+    const now = Date.now();
+    if (!force && now - run.lastBudgetBroadcastAt < 3000) return;
+    run.lastBudgetBroadcastAt = now;
+    const usage = this.computeUsageStats(run);
+    const budget = this.buildBudgetSnapshot(run);
+    run.lastSeq = eventBus.emit(run.projectId, {
+      type: 'agent_budget_update',
+      messageId: run.messageId,
+      usage,
+      budget,
+    });
+  }
+
+  private checkBudget(run: ActiveRun, forceEmit = false): void {
+    if (run.settled || run.budgetExceededReason) return;
+    const usage = this.computeUsageStats(run);
+    const limits = run.budget;
+
+    // 1. Check hard limits first (100% -> fast graceful abort)
+    let exceededReason: string | null = null;
+    if (usage.elapsedMs >= limits.maxDurationMs) {
+      const durText =
+        limits.maxDurationMs < 60_000
+          ? `${Math.round(limits.maxDurationMs / 1000)} 秒`
+          : `${(limits.maxDurationMs / 60_000).toFixed(limits.maxDurationMs % 60_000 === 0 ? 0 : 1)} 分钟`;
+      exceededReason = `达到时间预算上限（${durText}）`;
+    } else if (usage.estimatedCostCny >= limits.maxCostCny) {
+      exceededReason = `达到费用预算上限（¥${usage.estimatedCostCny.toFixed(3)} / ¥${limits.maxCostCny.toFixed(2)}）`;
+    } else if (usage.totalTokens >= limits.maxTokens) {
+      exceededReason = `达到 Token 预算上限（${usage.totalTokens.toLocaleString()} / ${limits.maxTokens.toLocaleString()} tokens）`;
+    } else if (usage.toolCalls >= limits.maxToolCalls) {
+      exceededReason = `达到工具步数预算上限（${usage.toolCalls} / ${limits.maxToolCalls} 步）`;
+    }
+
+    if (exceededReason) {
+      run.budgetExceededReason = exceededReason;
+      run.aborted = true;
+      run.lastError = exceededReason;
+      const statusText = `已触发预算硬上限（${exceededReason}），正在快速终止并保存已有成果...`;
+      run.statusText = statusText;
+      run.lastActivityAt = Date.now();
+      console.warn(
+        `[pi-agent] budget_exceeded runId=${run.runId} projectId=${run.projectId} reason="${exceededReason}" elapsedMs=${usage.elapsedMs} tokens=${usage.totalTokens} costCny=${usage.estimatedCostCny} tools=${usage.toolCalls}`,
+      );
+      run.lastSeq = eventBus.emit(run.projectId, {
+        type: 'agent_status',
+        messageId: run.messageId,
+        statusText,
+      });
+      this.emitBudgetUpdate(run, true);
+      this.broadcastActivity(run, true);
+      this.writeRpc(run.child, { id: `abort-budget-${++run.reqSeq}`, type: 'abort' });
+      setTimeout(() => {
+        if (!run.settled) {
+          try {
+            run.child.kill('SIGKILL');
+          } catch {
+            // ignore
+          }
+        }
+      }, 4000).unref();
+      return;
+    }
+
+    // 2. Check soft warning threshold (default 75% -> steer Agent to wrap up cleanly)
+    const ratios = [
+      { label: '时间', ratio: usage.elapsedMs / limits.maxDurationMs },
+      { label: '费用', ratio: usage.estimatedCostCny / limits.maxCostCny },
+      { label: 'Token', ratio: usage.totalTokens / limits.maxTokens },
+      { label: '工具步数', ratio: usage.toolCalls / limits.maxToolCalls },
+    ];
+    const highest = ratios.reduce((a, b) => (b.ratio > a.ratio ? b : a));
+
+    if (!run.softWarned && highest.ratio >= limits.softWarnRatio) {
+      run.softWarned = true;
+      const pct = Math.min(99, Math.round(highest.ratio * 100));
+      const isResearch = run.presetId === 'deep-research';
+      const steerMsg = isResearch
+        ? `【系统预算预警】当前任务${highest.label}预算已使用约 ${pct}%（已耗时 ${Math.round(usage.elapsedMs / 1000)}s / 工具调用 ${usage.toolCalls} 次 / Token ${usage.totalTokens.toLocaleString()} / 估算 ¥${usage.estimatedCostCny.toFixed(3)}）。请立刻停止发起新的 web_search / web_fetch / web_crawl，马上基于工作区已自动归档的 sources.json 和 sources/ 撰写完整带引用的 report.md，并在对话中输出核心结论摘要！`
+        : `【系统预算预警】当前任务${highest.label}预算已使用约 ${pct}%。请立刻停止继续发散探索，尽快完成核心改动、执行 npm run build 验证无报错并向用户汇报结果。`;
+      this.writeRpc(run.child, {
+        id: `steer-budget-${++run.reqSeq}`,
+        type: 'steer',
+        message: steerMsg,
+      });
+      const statusText = `预算已使用 ${pct}%（${highest.label}接近上限），已通知 Agent 停止继续发散并立即整理输出最终结果...`;
+      run.statusText = statusText;
+      console.warn(
+        `[pi-agent] budget_soft_warn runId=${run.runId} projectId=${run.projectId} metric=${highest.label} pct=${pct}% elapsedMs=${usage.elapsedMs} tokens=${usage.totalTokens} costCny=${usage.estimatedCostCny} tools=${usage.toolCalls}`,
+      );
+      run.lastSeq = eventBus.emit(run.projectId, {
+        type: 'agent_status',
+        messageId: run.messageId,
+        statusText,
+      });
+      this.emitBudgetUpdate(run, true);
+      this.broadcastActivity(run, true);
+      return;
+    }
+
+    if (forceEmit) {
+      this.emitBudgetUpdate(run, false);
+    }
+  }
+
   getActiveRunSnapshot(projectId: string): ActiveRunSnapshot | null {
     const run = this.activeRuns.get(projectId);
     if (run) {
@@ -232,6 +549,8 @@ class PiAgentManager {
         thinking: run.thinkingText,
         text: run.assistantText,
         steps: run.steps.map((s) => ({ ...s })),
+        usage: this.computeUsageStats(run),
+        budget: this.buildBudgetSnapshot(run),
         seq: run.lastSeq,
       };
     }
@@ -578,9 +897,12 @@ class PiAgentManager {
       return t;
     };
 
+    const effectiveBudget = resolveEffectiveBudget(isResearch, bundle.preset.manifest.budget);
+
     const run: ActiveRun = {
       projectId: params.projectId,
       workspaceId: params.workspaceId,
+      workspaceDir: params.workspaceDir,
       presetId: canonicalAgentId,
       owner: params.owner,
       runId,
@@ -589,6 +911,7 @@ class PiAgentManager {
       startedAt: now,
       lastActivityAt: now,
       lastActivityBroadcastAt: 0,
+      lastBudgetBroadcastAt: 0,
       statusText: initialStatus,
       lastSeq: startSeq,
       assistantText: '',
@@ -599,6 +922,12 @@ class PiAgentManager {
       settled: false,
       lastError: undefined,
       stderrBuf: '',
+      budget: effectiveBudget,
+      softWarned: false,
+      budgetExceededReason: undefined,
+      committedUsage: emptyUsageBucket(),
+      inflightUsage: emptyUsageBucket(),
+      toolCalls: 0,
       lastCheckpointAt: now,
       reqSeq: 0,
       onSettled: params.onSettled,
@@ -610,23 +939,28 @@ class PiAgentManager {
         );
       }, config.agentTimeoutMs),
       idleTimer: scheduleIdleTimer(),
+      budgetTimer: setInterval(() => {
+        this.checkBudget(run, true);
+      }, 5_000),
     };
     run.timeoutTimer.unref();
+    run.budgetTimer.unref();
 
     console.log(
-      `[pi-agent] start runId=${run.runId} projectId=${run.projectId} workspaceId=${run.workspaceId} agent=${run.presetId} model=${config.glmModel} idleTimeoutMs=${config.agentIdleTimeoutMs} maxTimeoutMs=${config.agentTimeoutMs}`,
+      `[pi-agent] start runId=${run.runId} projectId=${run.projectId} workspaceId=${run.workspaceId} agent=${run.presetId} model=${config.glmModel} budget=(dur=${Math.round(effectiveBudget.maxDurationMs / 1000)}s cost=¥${effectiveBudget.maxCostCny} tokens=${effectiveBudget.maxTokens} tools=${effectiveBudget.maxToolCalls})`,
     );
 
     this.activeRuns.set(params.projectId, run);
     this.workspaceActiveProject.set(params.workspaceId, params.projectId);
+    this.emitBudgetUpdate(run, true);
     this.broadcastActivity(run, true);
     this.emitWorkspaceUpdate(params.owner, params.workspaceId, false);
     this.attachSubprocessHandlers(run, scheduleIdleTimer);
 
     const agentPrompt = isResearch
       ? params.isInitialBuild
-        ? `请先阅读工作区里的 AGENTS.md、PROJECT_CONTEXT.md 以及已加载的 deep-research Skill，然后按四阶段研究流水线完成深度调研：\n1. 先写 plan.md 明确研究维度与子问题；\n2. 调用 mcp__web_research__web_search 进行多角度外网检索（含一手来源与反方观点）；\n3. 调用 mcp__web_research__web_fetch / web_crawl 精读关键网页全文，整理并写入合法 JSON 数组 sources.json；\n4. 撰写带内联引用 [1][2]、对比表格、置信度与争议分析的完整报告到 report.md。\n\n用户研究需求：\n${params.userMessage}\n\n完成后请检查 sources.json 为合法 JSON、report.md 内容完整，最后在对话中输出一份精炼的核心结论摘要，并提醒用户可在右侧「研究报告」面板查看完整交互式报告。`
-        : `请结合工作区已有的 plan.md、sources.json 与 report.md，根据用户的最新追问或补充需求，继续调用 mcp__web_research__web_search / web_fetch 检索新信源，更新 sources.json 和 report.md（保持引用编号一一对应且绝不编造链接），最后用简洁中文汇报新增发现。\n\n用户最新需求：\n${params.userMessage}`
+        ? `请先阅读工作区里的 AGENTS.md、PROJECT_CONTEXT.md 以及已加载的 deep-research Skill，然后按四阶段研究流水线完成深度调研：\n1. 先写 plan.md 明确研究维度与子问题；\n2. 执行 3–6 次聚焦的 mcp__web_research__web_search 多角度外网检索（结果会自动归档到 sources/00-search-digest.md 与 sources.json）；\n3. 挑选 4–8 篇最高价值一手网页调用 mcp__web_research__web_fetch / web_crawl 精读（每篇抓取后都会自动保存摘要与全文笔记到 sources/NN-*.md 并更新 sources.json，无需重复抄写全文）；\n4. 尽快撰写带内联引用 [1][2]、对比表格、置信度与争议分析的完整报告到 report.md。\n\n预算纪律：本任务受时间/费用/步数预算保护（约 ${Math.round(effectiveBudget.maxDurationMs / 60000)} 分钟、${effectiveBudget.maxToolCalls} 步），请避免无限发散检索；一旦收到系统预算预警请立即停搜并收口写完 report.md。\n\n用户研究需求：\n${params.userMessage}\n\n完成后请检查 sources.json 为合法 JSON、report.md 内容完整，最后在对话中输出一份精炼的核心结论摘要，并提醒用户可在右侧「研究报告」面板查看完整交互式报告。`
+        : `请结合工作区已有的 plan.md、sources.json、sources/ 笔记与 report.md，根据用户的最新追问或补充需求，聚焦调用 mcp__web_research__web_search / web_fetch 检索补充信源（工具会自动归档到 sources/ 与 sources.json），更新 report.md（保持引用编号一一对应且绝不编造链接），最后用简洁中文汇报新增发现。\n\n用户最新需求：\n${params.userMessage}`
       : params.isInitialBuild
         ? `请先阅读工作区里的 AGENTS.md、PROJECT_CONTEXT.md 以及已加载的 atoms-sqlite-storage Skill 指南，然后根据用户需求完成这个全栈网站的开发（前端 React+Tailwind 写在 client/，后端 Express 接口写在 server/index.js 并使用 ./db.js 代理客户端读写数据；同时优先调用 atoms_db MCP 工具完成建表和写入示例数据）。\n\n用户最新需求：\n${params.userMessage}\n\n完成后请务必执行 npm run build 确保前端编译通过，并检查 server/index.js 无语法错误，最后用简洁中文汇报你实现的功能、创建的数据表和交互亮点。不要在后台遗留运行中的服务器进程。`
         : `请根据用户的最新修改需求，在当前工作区（遵守 AGENTS.md 与 atoms-sqlite-storage Skill 规范，保持相对路径 ./api/... 并使用 atoms_db MCP / ./db.js 代理操作数据）进行增量修改，完成后执行 npm run build 验证无报错并汇报改动内容。\n\n用户需求：\n${params.userMessage}`;
@@ -786,6 +1120,7 @@ class PiAgentManager {
     for (const run of this.activeRuns.values()) {
       clearTimeout(run.timeoutTimer);
       clearTimeout(run.idleTimer);
+      clearInterval(run.budgetTimer);
       try {
         run.child.kill('SIGTERM');
       } catch {
@@ -809,6 +1144,8 @@ class PiAgentManager {
         agentId: run.presetId,
         thinking: run.thinkingText || undefined,
         steps: run.steps,
+        usage: this.computeUsageStats(run),
+        budget: this.buildBudgetSnapshot(run),
       });
     } catch {
       // non-fatal; final message will still be saved in finalizeRun
@@ -909,6 +1246,11 @@ class PiAgentManager {
     }
 
     if (type === 'message_update') {
+      const liveUsage = parseUsageBucket(record.usage);
+      if (liveUsage) {
+        run.inflightUsage = liveUsage;
+        this.emitBudgetUpdate(run, false);
+      }
       const evt = record.assistantMessageEvent as Record<string, unknown> | undefined;
       if (!evt) return;
       const evtType = String(evt.type || '');
@@ -987,6 +1329,15 @@ class PiAgentManager {
     if (type === 'message_end') {
       const msg = record.message as Record<string, unknown> | undefined;
       if (msg && msg.role === 'assistant') {
+        const finalTurnUsage = parseUsageBucket(msg.usage) || (run.inflightUsage.total > 0 ? { ...run.inflightUsage } : null);
+        if (finalTurnUsage) {
+          run.committedUsage.input += finalTurnUsage.input;
+          run.committedUsage.output += finalTurnUsage.output;
+          run.committedUsage.cacheRead += finalTurnUsage.cacheRead;
+          run.committedUsage.total += finalTurnUsage.total;
+        }
+        run.inflightUsage = emptyUsageBucket();
+
         const stopReason = String(msg.stopReason || '');
         if (stopReason === 'error') {
           const errText =
@@ -1000,6 +1351,7 @@ class PiAgentManager {
         } else if (stopReason === 'stop' || stopReason === 'toolUse') {
           run.lastError = undefined;
         }
+        this.checkBudget(run, true);
       }
       this.persistCheckpoint(run, false);
       return;
@@ -1064,11 +1416,21 @@ class PiAgentManager {
 
     if (type === 'compaction_end') {
       run.statusText = undefined;
+      const resultObj = record.result as Record<string, unknown> | undefined;
+      const compUsage = parseUsageBucket(resultObj?.usage);
+      if (compUsage) {
+        run.committedUsage.input += compUsage.input;
+        run.committedUsage.output += compUsage.output;
+        run.committedUsage.cacheRead += compUsage.cacheRead;
+        run.committedUsage.total += compUsage.total;
+        this.checkBudget(run, true);
+      }
       console.log(`[pi-agent] compaction_end runId=${run.runId} projectId=${run.projectId} aborted=${Boolean(record.aborted)}`);
       return;
     }
 
     if (type === 'tool_execution_start') {
+      run.toolCalls += 1;
       const stepId = String(record.toolCallId || `exec-${run.steps.length + 1}`);
       const toolName = String(record.toolName || 'tool');
       const argsSummary = summarizeToolArgs(toolName, record.args);
@@ -1097,6 +1459,7 @@ class PiAgentManager {
           step: { ...step },
         });
       }
+      this.checkBudget(run, true);
       this.broadcastActivity(run, true);
       return;
     }
@@ -1134,6 +1497,7 @@ class PiAgentManager {
           output,
         });
         this.persistCheckpoint(run, true);
+        this.checkBudget(run, true);
         this.broadcastActivity(run, true);
       }
       return;
@@ -1175,6 +1539,7 @@ class PiAgentManager {
     run.settled = true;
     clearTimeout(run.timeoutTimer);
     clearTimeout(run.idleTimer);
+    clearInterval(run.budgetTimer);
 
     try {
       run.child.stdin.end();
@@ -1185,12 +1550,45 @@ class PiAgentManager {
       // ignore
     }
 
+    const finalUsage = this.computeUsageStats(run);
+    const finalBudget = this.buildBudgetSnapshot(run);
+
     let previewUrl: string | null = null;
     const isResearch = run.presetId === 'deep-research';
     const workspaceStillExists = Boolean(dbStore.getWorkspace(run.workspaceId));
-    if (status === 'succeeded' && workspaceStillExists) {
+
+    // For Deep Research, guarantee we NEVER leave the user empty-handed on manual abort,
+    // budget cutoff, or error: synthesize a readable partial report from auto-archived sources.
+    let researchArchive = { synthesized: false, hasArtifacts: false, totalSources: 0, fetchedCount: 0 };
+    if (isResearch && workspaceStillExists) {
+      const reasonLabel = run.budgetExceededReason
+        ? run.budgetExceededReason
+        : status === 'aborted'
+          ? '用户主动终止'
+          : status === 'failed'
+            ? `执行中断（${error || '未知错误'}）`
+            : '自动整理归档';
+      try {
+        researchArchive = synthesizePartialResearchReportIfNeeded(
+          run.workspaceDir,
+          reasonLabel,
+          finalUsage,
+        );
+      } catch (err) {
+        console.warn(
+          `[pi-agent] partial_report_synthesis_failed runId=${run.runId} err=${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    const shouldStartPreview =
+      workspaceStillExists && (status === 'succeeded' || (isResearch && researchArchive.hasArtifacts));
+
+    if (shouldStartPreview) {
       const statusText = isResearch
-        ? '研究报告已完成，正在启动交互式报告预览服务...'
+        ? status === 'succeeded'
+          ? '研究报告已完成，正在启动交互式报告预览服务...'
+          : '已自动保存阶段性调研摘要，正在刷新研究报告预览...'
         : '代码已完成，正在启动全栈应用与 SQLite 数据库预览服务...';
       run.statusText = statusText;
       run.lastActivityAt = Date.now();
@@ -1204,25 +1602,33 @@ class PiAgentManager {
         previewUrl = await run.onSettled(run.workspaceId, true);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        error = `预览服务启动失败: ${msg}`;
-        status = 'failed';
+        if (status === 'succeeded') {
+          error = `预览服务启动失败: ${msg}`;
+          status = 'failed';
+        }
       }
     }
 
+    const archiveNote =
+      isResearch && researchArchive.totalSources > 0
+        ? `\n\n已自动保留 **${researchArchive.totalSources}** 条检索信源（含 **${researchArchive.fetchedCount}** 篇精读全文笔记，存放在 \`sources/\` 与 \`sources.json\`），${researchArchive.synthesized ? '并已为你自动生成阶段性调研摘要报告。' : '当前报告已保留在 `report.md`。'}你可以在右侧「研究报告」面板查看，或继续发消息让我基于已收集信源整理最终完整报告。`
+        : '';
+
     const finalContent =
-      run.assistantText.trim() ||
-      (status === 'aborted'
-        ? error
-          ? `任务已终止：${error}。你可以继续输入新的需求或重试。`
-          : '已停止本次任务。你可以继续输入新的需求或修改意见。'
-        : status === 'failed'
-          ? `执行过程中遇到错误：${error || '未知错误'}`
-          : isResearch
-            ? '深度研究报告已生成！你可以在右侧「研究报告」面板查看完整内容与参考信源。'
-            : '全栈项目构建完成！你可以在右侧预览并与应用交互。');
+      run.assistantText.trim()
+        ? `${run.assistantText.trim()}${status !== 'succeeded' ? archiveNote : ''}`
+        : status === 'aborted'
+          ? error
+            ? `任务已因预算/超时保护终止：${error}。${archiveNote || '你可以继续输入新的需求或重试。'}`
+            : `已停止本次任务。${archiveNote || '你可以继续输入新的需求或修改意见。'}`
+          : status === 'failed'
+            ? `执行过程中遇到错误：${error || '未知错误'}${archiveNote}`
+            : isResearch
+              ? '深度研究报告已生成！你可以在右侧「研究报告」面板查看完整内容与参考信源。'
+              : '全栈项目构建完成！你可以在右侧预览并与应用交互。';
 
     console.log(
-      `[pi-agent] finalized runId=${run.runId} projectId=${run.projectId} workspaceId=${run.workspaceId} status=${status} durationMs=${Date.now() - run.startedAt} steps=${run.steps.length} preview=${Boolean(previewUrl)}${error ? ` err=${error.slice(0, 240)}` : ''}`,
+      `[pi-agent] finalized runId=${run.runId} projectId=${run.projectId} workspaceId=${run.workspaceId} status=${status} durationMs=${finalUsage.elapsedMs} tokens=${finalUsage.totalTokens} costCny=${finalUsage.estimatedCostCny} tools=${finalUsage.toolCalls} steps=${run.steps.length} archivedSources=${researchArchive.totalSources} preview=${Boolean(previewUrl)}${error ? ` err=${error.slice(0, 240)}` : ''}`,
     );
 
     const metadata: MessageMetadata = {
@@ -1233,6 +1639,8 @@ class PiAgentManager {
       previewUrl: previewUrl || undefined,
       aborted: status === 'aborted' || undefined,
       error,
+      usage: finalUsage,
+      budget: finalBudget,
     };
 
     // Thread may have been deleted while the agent process was winding down.

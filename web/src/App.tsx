@@ -98,6 +98,8 @@ function snapshotToLiveStream(snapshot: ActiveRunSnapshot | null | undefined): L
     statusText: snapshot.statusText,
     startedAt: snapshot.startedAt,
     lastActivityAt: snapshot.lastActivityAt,
+    usage: snapshot.usage,
+    budget: snapshot.budget,
     seq: snapshot.seq,
   };
 }
@@ -535,6 +537,19 @@ export default function App() {
                 return {
                   ...prev,
                   statusText: parsed.statusText,
+                  lastActivityAt: nowTs,
+                  seq,
+                };
+              });
+              break;
+
+            case 'agent_budget_update':
+              setLiveStream((prev) => {
+                if (!prev || prev.messageId !== parsed.messageId) return prev;
+                return {
+                  ...prev,
+                  usage: parsed.usage,
+                  budget: parsed.budget,
                   lastActivityAt: nowTs,
                   seq,
                 };

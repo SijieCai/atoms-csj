@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type {
+  AgentBudgetConfig,
   AgentIconType,
   AgentIntentSpec,
   AgentPresetSummary,
@@ -47,6 +48,7 @@ export interface PresetManifest {
   systemPromptFile?: string;
   systemPromptAppend?: string;
   intent?: AgentIntentSpec;
+  budget?: Partial<AgentBudgetConfig>;
   ui?: Partial<AgentUISpec>;
 }
 
@@ -255,6 +257,7 @@ class PluginRegistry {
       templateId: preset.manifest.templateId,
       plugins: preset.plugins.map((p) => this.toPluginSummary(p)),
       intent: preset.manifest.intent,
+      budget: preset.manifest.budget,
       ui: preset.ui,
     }));
   }
@@ -274,7 +277,12 @@ class PluginRegistry {
    * Computes scoped runtime environment variables for a workspace's enabled plugins.
    * Injected into BOTH Pi's MCP servers and the generated app's runtime process.
    */
-  buildProjectRuntimeEnv(owner: string, workspaceId: string, presetId?: string): Record<string, string> {
+  buildProjectRuntimeEnv(
+    owner: string,
+    workspaceId: string,
+    presetId?: string,
+    workspaceDir?: string,
+  ): Record<string, string> {
     const preset = this.getPreset(presetId);
     const env: Record<string, string> = {};
 
@@ -287,6 +295,7 @@ class PluginRegistry {
 
     const hasDeepResearch = preset.plugins.some((p) => p.manifest.id === 'deep-research');
     if (hasDeepResearch) {
+      if (workspaceDir) env.ATOMS_WORKSPACE_DIR = workspaceDir;
       if (config.tavilyApiKey) env.TAVILY_API_KEY = config.tavilyApiKey;
       if (config.firecrawlApiKey) env.FIRECRAWL_API_KEY = config.firecrawlApiKey;
     }
@@ -307,7 +316,12 @@ class PluginRegistry {
     presetId?: string;
   }): PreparedAgentBundle {
     const preset = this.getPreset(params.presetId);
-    const runtimeEnv = this.buildProjectRuntimeEnv(params.owner, params.projectId, preset.manifest.id);
+    const runtimeEnv = this.buildProjectRuntimeEnv(
+      params.owner,
+      params.projectId,
+      preset.manifest.id,
+      params.workspaceDir,
+    );
 
     const piAgentDir = path.join(params.workspaceDir, '.pi-agent');
     fs.mkdirSync(piAgentDir, { recursive: true });
@@ -331,7 +345,12 @@ class PluginRegistry {
               input: isMultimodal ? ['text', 'image'] : ['text'],
               contextWindow: isGlm5Series ? 1_000_000 : 204_800,
               maxTokens: isGlm5Series ? 65_536 : 16_384,
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              cost: {
+                input: config.glmInputPricePerM,
+                output: config.glmOutputPricePerM,
+                cacheRead: config.glmCacheReadPricePerM,
+                cacheWrite: 0,
+              },
               compat: {
                 supportsStore: false,
                 supportsReasoningEffort: false,
